@@ -163,32 +163,38 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-nam
 #### Versioning experiments as YAML
 
 For a new experiment that uses an existing model and robot transform, you do not need to edit
-`src/openpi/training/config.py`. Add a versioned YAML file under `configs/experiments/` that extends a built-in
-configuration. See [`pi05_template.yaml`](configs/experiments/pi05_template.yaml) for a fully annotated π0.5
-template containing every declarative training field:
+`src/openpi/training/config.py`. Add a standalone YAML file under `configs/experiments/`. Component `type` fields
+select safe, registered Python implementations without inheriting an experiment from `_CONFIGS`. See
+[`pi05_template.yaml`](configs/experiments/pi05_template.yaml) for a fully annotated π0.5 template containing every
+declarative training field:
 
 ```yaml
 schema_version: 1
 name: pi05_my_libero
-base: pi05_libero
-overrides:
-  data:
-    repo_id: my-org/my-libero
+model:
+  type: pi0
+  pi05: true
+  # ...all remaining model fields...
+data:
+  type: lerobot_libero
+  repo_id: my-org/my-libero
+  # ...all remaining data fields...
+training:
   batch_size: 64
   num_train_steps: 30000
+# ...checkpoint, optimizer, logging, paths, and other sections...
 ```
 
 Then use the YAML path anywhere a training config is accepted:
 
 ```bash
 uv run scripts/compute_norm_stats.py --config configs/experiments/pi05_my_libero.yaml
-uv run scripts/train.py configs/experiments/pi05_my_libero.yaml --exp-name=baseline --overwrite
+uv run scripts/train.py configs/experiments/pi05_my_libero.yaml
 ```
 
-Command-line flags still override YAML values. Runtime-specific values such as `--exp-name`, `--resume`,
-`--overwrite`, and local checkpoint/data paths should stay on the command line instead of being committed. Each
-checkpoint records the source config, effective command-line overrides, resolved config, and Git revision in
-`metadata/train_config.yaml`.
+Command-line flags still override YAML values. The older `base + overrides` YAML format remains supported for
+compatibility, but standalone configs are recommended for complete reproducibility. Each checkpoint records the source
+manifest, effective command-line overrides, resolved config, and Git revision in `metadata/train_config.yaml`.
 
 Python changes are still required when adding a new model implementation, data config factory, or robot transform.
 

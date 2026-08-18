@@ -1,9 +1,4 @@
-"""Load versioned experiment configs from YAML files.
-
-YAML configs intentionally extend an existing Python config instead of constructing arbitrary
-Python objects. This keeps model and transform registration in Python while allowing experiments
-to be reviewed and versioned as data.
-"""
+"""Load versioned experiment configs from safe, declarative YAML files."""
 
 from __future__ import annotations
 
@@ -64,23 +59,29 @@ class ResolvedTrainConfig:
     """A TrainConfig together with the information needed to reproduce how it was built."""
 
     config: Any
-    base: str
+    base: str | None
     source: str
     overrides: dict[str, Any] = dataclasses.field(default_factory=dict)
+    manifest: dict[str, Any] | None = None
     cli_args: tuple[str, ...] = ()
 
     def snapshot(self) -> dict[str, Any]:
-        return {
+        snapshot = {
             "schema_version": SCHEMA_VERSION,
             "name": self.config.name,
-            "base": self.base,
+            "mode": "standalone" if self.base is None else "inherited",
             "source": self.source,
-            "overrides": self.overrides,
             "cli_args": list(self.cli_args),
             "git": _git_provenance(),
             "resolved_config": _to_serializable(self.config),
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
         }
+        if self.base is None:
+            snapshot["manifest"] = self.manifest
+        else:
+            snapshot["base"] = self.base
+            snapshot["overrides"] = self.overrides
+        return snapshot
 
 
 def is_yaml_ref(config_ref: str | pathlib.Path) -> bool:
@@ -88,9 +89,7 @@ def is_yaml_ref(config_ref: str | pathlib.Path) -> bool:
 
 
 def load_yaml_config(path: str | pathlib.Path) -> ResolvedTrainConfig:
-    """Load a YAML experiment config and merge it into its built-in base config."""
-    from openpi.training import config as _config
-
+    """Load either a standalone YAML config or a legacy base/overrides config."""
     config_path = pathlib.Path(path).expanduser()
     if not config_path.is_file():
         raise FileNotFoundError(f"Experiment config does not exist: {config_path}")
@@ -102,23 +101,22 @@ def load_yaml_config(path: str | pathlib.Path) -> ResolvedTrainConfig:
 
     if not isinstance(contents, dict):
         raise ConfigError(f"Experiment config must contain a YAML mapping: {config_path}")
-    allowed_keys = {"schema_version", "name", "base", "overrides"}
-    if unknown_keys := set(contents) - allowed_keys:
-        raise ConfigError(f"Unknown top-level fields in {config_path}: {sorted(unknown_keys)}")
-
     if contents.get("schema_version") != SCHEMA_VERSION:
-        raise ConfigError(
-            f"Unsupported schema_version {contents.get('schema_version')!r}; expected {SCHEMA_VERSION}"
-        )
-    name = contents.get("name")
-    base = contents.get("base")
-    overrides = contents.get("overrides", {})
-    if not isinstance(name, str) or not name:
-        raise ConfigError("'name' must be a non-empty string")
-    if not isinstance(base, str) or not base:
-        raise ConfigError("'base' must be a non-empty string")
-    if not isinstance(overrides, dict):
-        raise ConfigError("'overrides' must be a mapping")
+        raise ConfigError(f"Unsupported schema_version {contents.get('schema_version')!r}; expected {SCHEMA_VERSION}")
+    if "base" in contents or "overrides" in contents:
+        return _load_inherited_config(contents, config_path)
+    return _load_standalone_config(contents, config_path)
+
+
+def _load_inherited_config(contents: dict[str, Any], config_path: pathlib.Path) -> ResolvedTrainConfig:
+    """Load the original base + overrides YAML format."""
+    from openpi.training import config as _config
+
+    allowed_keys = {"schema_version", "name", "base", "overrides"}
+    _check_keys(contents, allowed_keys, allowed_keys - {"overrides"}, "config")
+    name = _nonempty_string(contents["name"], "name")
+    base = _nonempty_string(contents["base"], "base")
+    overrides = _mapping(contents.get("overrides", {}), "overrides")
 
     base_config = _config.get_builtin_config(base)
     merged = _merge_dataclass(base_config, overrides)
@@ -127,8 +125,308 @@ def load_yaml_config(path: str | pathlib.Path) -> ResolvedTrainConfig:
         config=merged,
         base=base,
         source=str(config_path.resolve()),
-        overrides=overrides,
+        overrides=dict(overrides),
     )
+
+
+def _load_standalone_config(contents: dict[str, Any], config_path: pathlib.Path) -> ResolvedTrainConfig:
+    """Construct a complete TrainConfig from registered component types."""
+    import flax.nnx as nnx
+
+    import openpi.models.pi0_config as pi0_config
+    import openpi.models.pi0_fast as pi0_fast
+    import openpi.training.config as _config
+    import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+    import openpi.training.optimizer as optimizer
+    import openpi.training.weight_loaders as weight_loaders
+
+    top_level_fields = {
+        "schema_version",
+        "name",
+        "model",
+        "data",
+        "weight_loader",
+        "lr_schedule",
+        "optimizer",
+        "training",
+        "paths",
+        "checkpoint",
+        "logging",
+        "distributed",
+        "pytorch",
+        "policy_metadata",
+    }
+    _check_keys(contents, top_level_fields, top_level_fields, "config")
+    name = _nonempty_string(contents["name"], "name")
+
+    model = _build_registered_dataclass(
+        contents["model"],
+        "model",
+        {
+            "pi0": pi0_config.Pi0Config(),
+            "pi0_fast": pi0_fast.Pi0FASTConfig(),
+        },
+    )
+    data = _build_data_config(contents["data"], _config, droid_rlds_dataset)
+    weight_loader = _build_registered_dataclass(
+        contents["weight_loader"],
+        "weight_loader",
+        {
+            "none": weight_loaders.NoOpWeightLoader(),
+            "checkpoint": weight_loaders.CheckpointWeightLoader(params_path=""),
+            "paligemma": weight_loaders.PaliGemmaWeightLoader(),
+        },
+    )
+    lr_schedule = _build_registered_dataclass(
+        contents["lr_schedule"],
+        "lr_schedule",
+        {
+            "cosine_decay": optimizer.CosineDecaySchedule(),
+            "rsqrt_decay": optimizer.RsqrtDecaySchedule(),
+        },
+    )
+    optimizer_config = _build_registered_dataclass(
+        contents["optimizer"],
+        "optimizer",
+        {
+            "adamw": optimizer.AdamW(),
+            "sgd": optimizer.SGD(),
+        },
+    )
+
+    training = _validated_section(
+        contents["training"],
+        "training",
+        {
+            "seed": 42,
+            "batch_size": 32,
+            "num_workers": 2,
+            "num_train_steps": 30_000,
+            "ema_decay": 0.99,
+            "freeze_mode": "full",
+        },
+        nullable={"ema_decay"},
+    )
+    paths = _validated_section(
+        contents["paths"],
+        "paths",
+        {"assets_base_dir": "./assets", "checkpoint_base_dir": "./checkpoints"},
+    )
+    checkpoint = _validated_section(
+        contents["checkpoint"],
+        "checkpoint",
+        {
+            "exp_name": "",
+            "save_interval": 1000,
+            "keep_period": 5000,
+            "overwrite": False,
+            "resume": False,
+        },
+        nullable={"keep_period"},
+    )
+    logging_config = _validated_section(
+        contents["logging"],
+        "logging",
+        {"project_name": "openpi", "wandb_enabled": True, "log_interval": 100},
+    )
+    distributed = _validated_section(
+        contents["distributed"],
+        "distributed",
+        {"fsdp_devices": 1},
+    )
+    pytorch = _validated_section(
+        contents["pytorch"],
+        "pytorch",
+        {"weight_path": "", "training_precision": "bfloat16"},
+        nullable={"weight_path"},
+    )
+
+    freeze_mode = training.pop("freeze_mode")
+    if freeze_mode == "full":
+        freeze_filter = nnx.Nothing()
+    elif freeze_mode == "lora":
+        variants = (
+            getattr(model, "paligemma_variant", ""),
+            getattr(model, "action_expert_variant", ""),
+        )
+        if not any("lora" in variant for variant in variants):
+            raise ConfigError("training.freeze_mode=lora requires a model variant containing 'lora'")
+        freeze_filter = model.get_freeze_filter()
+    else:
+        raise ConfigError("training.freeze_mode must be 'full' or 'lora'")
+
+    if pytorch["training_precision"] not in {"bfloat16", "float32"}:
+        raise ConfigError("pytorch.training_precision must be 'bfloat16' or 'float32'")
+    if checkpoint["overwrite"] and checkpoint["resume"]:
+        raise ConfigError("checkpoint.overwrite and checkpoint.resume cannot both be true")
+
+    policy_metadata = contents["policy_metadata"]
+    if policy_metadata is not None and not isinstance(policy_metadata, dict):
+        raise ConfigError("policy_metadata must be a mapping or null")
+
+    train_config = _config.TrainConfig(
+        name=name,
+        project_name=logging_config["project_name"],
+        exp_name=checkpoint["exp_name"],
+        model=model,
+        weight_loader=weight_loader,
+        pytorch_weight_path=pytorch["weight_path"],
+        pytorch_training_precision=pytorch["training_precision"],
+        lr_schedule=lr_schedule,
+        optimizer=optimizer_config,
+        ema_decay=training["ema_decay"],
+        freeze_filter=freeze_filter,
+        data=data,
+        assets_base_dir=paths["assets_base_dir"],
+        checkpoint_base_dir=paths["checkpoint_base_dir"],
+        seed=training["seed"],
+        batch_size=training["batch_size"],
+        num_workers=training["num_workers"],
+        num_train_steps=training["num_train_steps"],
+        log_interval=logging_config["log_interval"],
+        save_interval=checkpoint["save_interval"],
+        keep_period=checkpoint["keep_period"],
+        overwrite=checkpoint["overwrite"],
+        resume=checkpoint["resume"],
+        wandb_enabled=logging_config["wandb_enabled"],
+        policy_metadata=policy_metadata,
+        fsdp_devices=distributed["fsdp_devices"],
+    )
+    return ResolvedTrainConfig(
+        config=train_config,
+        base=None,
+        source=str(config_path.resolve()),
+        manifest=contents,
+    )
+
+
+def _build_data_config(section: Any, config_module: Any, droid_module: Any) -> Any:
+    payload = dict(_mapping(section, "data"))
+    type_name = payload.pop("type", None)
+    if not isinstance(type_name, str):
+        raise ConfigError("data.type must be a string")
+
+    required_fields = {
+        "fake": {"repo_id", "assets", "base_config"},
+        "lerobot_libero": {"repo_id", "assets", "base_config", "extra_delta_transform"},
+        "lerobot_aloha": {
+            "repo_id",
+            "assets",
+            "base_config",
+            "use_delta_joint_actions",
+            "default_prompt",
+            "adapt_to_pi",
+            "action_sequence_keys",
+        },
+        "lerobot_droid": {"repo_id", "assets", "base_config"},
+        "rlds_droid": {"repo_id", "assets", "base_config", "rlds_data_dir", "action_space", "datasets"},
+    }
+    if type_name not in required_fields:
+        raise ConfigError(f"Unknown data.type {type_name!r}; expected one of {sorted(required_fields)}")
+    if missing := required_fields[type_name] - set(payload):
+        raise ConfigError(f"Missing required fields at data: {sorted(missing)}")
+
+    assets_payload = _mapping(payload["assets"], "data.assets")
+    _check_keys(assets_payload, {"assets_dir", "asset_id"}, {"assets_dir", "asset_id"}, "data.assets")
+
+    base_config_value = payload.get("base_config")
+    if base_config_value is not None:
+        base_payload = _mapping(base_config_value, "data.base_config")
+        allowed_base_fields = {"prompt_from_task", "action_sequence_keys"}
+        _check_keys(base_payload, allowed_base_fields, allowed_base_fields, "data.base_config")
+        action_keys = base_payload.get("action_sequence_keys", ["actions"])
+        if not isinstance(action_keys, list) or not all(isinstance(key, str) for key in action_keys):
+            raise ConfigError("data.base_config.action_sequence_keys must be a list of strings")
+        payload["base_config"] = {
+            "prompt_from_task": base_payload["prompt_from_task"],
+            "action_sequence_keys": action_keys,
+        }
+
+    registry = {
+        "fake": config_module.FakeDataConfig(base_config=config_module.DataConfig()),
+        "lerobot_libero": config_module.LeRobotLiberoDataConfig(repo_id="", base_config=config_module.DataConfig()),
+        "lerobot_aloha": config_module.LeRobotAlohaDataConfig(repo_id="", base_config=config_module.DataConfig()),
+        "lerobot_droid": config_module.LeRobotDROIDDataConfig(repo_id="", base_config=config_module.DataConfig()),
+        "rlds_droid": config_module.RLDSDroidDataConfig(repo_id="", base_config=config_module.DataConfig()),
+    }
+    if type_name == "rlds_droid":
+        action_space = payload.get("action_space")
+        action_spaces = {
+            "joint_position": droid_module.DroidActionSpace.JOINT_POSITION,
+            "joint_velocity": droid_module.DroidActionSpace.JOINT_VELOCITY,
+        }
+        if action_space not in action_spaces:
+            raise ConfigError(f"data.action_space must be one of {sorted(action_spaces)}")
+        payload["action_space"] = action_spaces[action_space]
+        datasets = payload.get("datasets")
+        if not isinstance(datasets, list) or not datasets:
+            raise ConfigError("data.datasets must be a non-empty list")
+        parsed_datasets = []
+        dataset_fields = {"name", "version", "weight", "filter_dict_path"}
+        for index, dataset in enumerate(datasets):
+            dataset_payload = _mapping(dataset, f"data.datasets[{index}]")
+            _check_keys(
+                dataset_payload, dataset_fields, dataset_fields - {"filter_dict_path"}, f"data.datasets[{index}]"
+            )
+            parsed_datasets.append(droid_module.RLDSDataset(**dataset_payload))
+        payload["datasets"] = tuple(parsed_datasets)
+
+    return _merge_dataclass(registry[type_name], payload, ("data",), enforce_runtime_only=False)
+
+
+def _build_registered_dataclass(section: Any, path: str, registry: Mapping[str, Any]) -> Any:
+    payload = dict(_mapping(section, path))
+    type_name = payload.pop("type", None)
+    if not isinstance(type_name, str):
+        raise ConfigError(f"{path}.type must be a string")
+    if type_name not in registry:
+        raise ConfigError(f"Unknown {path}.type {type_name!r}; expected one of {sorted(registry)}")
+    prototype = registry[type_name]
+    required_fields = {field.name for field in dataclasses.fields(prototype) if field.init}
+    if missing := required_fields - set(payload):
+        raise ConfigError(f"Missing required fields at {path}: {sorted(missing)}")
+    return _merge_dataclass(prototype, payload, (path,), enforce_runtime_only=False)
+
+
+def _validated_section(
+    section: Any,
+    path: str,
+    defaults: Mapping[str, Any],
+    *,
+    nullable: set[str] | None = None,
+) -> dict[str, Any]:
+    payload = _mapping(section, path)
+    _check_keys(payload, set(defaults), set(defaults), path)
+    nullable = nullable or set()
+    result = {}
+    for name, default in defaults.items():
+        value = payload[name]
+        if value is None and name in nullable:
+            result[name] = None
+        else:
+            result[name] = _coerce_value(default, value, (path, name))
+    return result
+
+
+def _mapping(value: Any, path: str) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{path} must be a mapping")
+    if not all(isinstance(key, str) for key in value):
+        raise ConfigError(f"{path} keys must be strings")
+    return value
+
+
+def _nonempty_string(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{path} must be a non-empty string")
+    return value
+
+
+def _check_keys(payload: Mapping[str, Any], allowed: set[str], required: set[str], path: str) -> None:
+    if unknown := set(payload) - allowed:
+        raise ConfigError(f"Unknown fields at {path}: {sorted(unknown)}")
+    if missing := required - set(payload):
+        raise ConfigError(f"Missing required fields at {path}: {sorted(missing)}")
 
 
 def resolve_config(config_ref: str | pathlib.Path) -> ResolvedTrainConfig:
@@ -190,7 +488,13 @@ def write_snapshot(path: str | pathlib.Path, snapshot: Mapping[str, Any]) -> Non
     output_path.write_text(yaml.safe_dump(dict(snapshot), sort_keys=False, allow_unicode=True))
 
 
-def _merge_dataclass(current: Any, overrides: Mapping[str, Any], path: tuple[str, ...] = ()) -> Any:
+def _merge_dataclass(
+    current: Any,
+    overrides: Mapping[str, Any],
+    path: tuple[str, ...] = (),
+    *,
+    enforce_runtime_only: bool = True,
+) -> Any:
     if not dataclasses.is_dataclass(current) or isinstance(current, type):
         raise ConfigError(f"Cannot apply nested overrides to {_format_path(path)}")
     if not isinstance(overrides, Mapping):
@@ -203,15 +507,18 @@ def _merge_dataclass(current: Any, overrides: Mapping[str, Any], path: tuple[str
     updates = {}
     for name, override in overrides.items():
         field_path = (*path, name)
-        if field_path in _RUNTIME_ONLY_PATHS:
-            raise ConfigError(
-                f"{_format_path(field_path)} is runtime-only; provide it as a command-line override"
-            )
+        if enforce_runtime_only and field_path in _RUNTIME_ONLY_PATHS:
+            raise ConfigError(f"{_format_path(field_path)} is runtime-only; provide it as a command-line override")
         current_value = getattr(current, name)
         if dataclasses.is_dataclass(current_value) and not isinstance(current_value, type):
             if not isinstance(override, Mapping):
                 raise ConfigError(f"Expected a mapping at {_format_path(field_path)}")
-            updates[name] = _merge_dataclass(current_value, override, field_path)
+            updates[name] = _merge_dataclass(
+                current_value,
+                override,
+                field_path,
+                enforce_runtime_only=enforce_runtime_only,
+            )
         else:
             updates[name] = _coerce_value(current_value, override, field_path)
     try:
