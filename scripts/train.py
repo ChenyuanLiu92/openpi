@@ -21,6 +21,7 @@ import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
+import openpi.training.config_loader as _config_loader
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
@@ -191,7 +192,7 @@ def train_step(
     return new_state, info
 
 
-def main(config: _config.TrainConfig):
+def main(config: _config.TrainConfig, *, config_snapshot: dict | None = None):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -215,6 +216,7 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
+    config_snapshot = config_snapshot or _config_loader.snapshot_for_config(config)
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     data_loader = _data_loader.create_data_loader(
@@ -270,11 +272,18 @@ def main(config: _config.TrainConfig):
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            _checkpoints.save_state(
+                checkpoint_manager,
+                train_state,
+                data_loader,
+                step,
+                config_snapshot=config_snapshot,
+            )
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
 
 
 if __name__ == "__main__":
-    main(_config.cli())
+    resolved_config = _config.cli_with_metadata()
+    main(resolved_config.config, config_snapshot=resolved_config.snapshot())

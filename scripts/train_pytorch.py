@@ -44,6 +44,7 @@ import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
+import openpi.training.config_loader as _config_loader
 import openpi.training.data_loader as _data
 
 
@@ -146,7 +147,7 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, config_snapshot):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -176,6 +177,8 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             "timestamp": time.time(),
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+
+        _config_loader.write_snapshot(tmp_ckpt_dir / "metadata" / "train_config.yaml", config_snapshot)
 
         # save norm stats
         norm_stats = data_config.norm_stats
@@ -306,10 +309,11 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
-def train_loop(config: _config.TrainConfig):
+def train_loop(config: _config.TrainConfig, *, config_snapshot: dict | None = None):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
+    config_snapshot = config_snapshot or _config_loader.snapshot_for_config(config)
 
     # Initialize checkpoint directory and wandb
     resuming = False
@@ -602,7 +606,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, config_snapshot)
 
             # Update progress bar
             if pbar is not None:
@@ -624,8 +628,8 @@ def train_loop(config: _config.TrainConfig):
 
 def main():
     init_logging()
-    config = _config.cli()
-    train_loop(config)
+    resolved_config = _config.cli_with_metadata()
+    train_loop(resolved_config.config, config_snapshot=resolved_config.snapshot())
 
 
 if __name__ == "__main__":
