@@ -187,13 +187,23 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        action_mask: at.Bool[at.Array, "*b ah ad"] | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
+        if action_mask is not None:
+            action_mask = jnp.asarray(action_mask, dtype=jnp.bool_)
+            actions = jnp.where(action_mask, actions, 0.0)
+            noise = jnp.where(action_mask, noise, 0.0)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -211,7 +221,10 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        squared_error = jnp.square(v_t - u_t)
+        if action_mask is None:
+            return jnp.mean(squared_error, axis=-1)
+        return _masked_action_loss(squared_error, action_mask)
 
     @override
     def sample_actions(
@@ -277,3 +290,8 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+
+def _masked_action_loss(squared_error: at.Array, action_mask: at.Array) -> at.Array:
+    mask = action_mask.astype(squared_error.dtype)
+    return jnp.sum(squared_error * mask, axis=-1) / jnp.clip(jnp.sum(mask, axis=-1), 1)

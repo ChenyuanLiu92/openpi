@@ -21,7 +21,7 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 
 ## Requirements
 
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
+To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the fine-tuning script does not yet support multi-node training. The dedicated [π0.5 pretraining pipeline](docs/pretraining.md) supports native JAX multi-host execution.
 
 | Mode               | Memory Required | Example GPU        |
 | ------------------ | --------------- | ------------------ |
@@ -197,6 +197,11 @@ compatibility, but standalone configs are recommended for complete reproducibili
 manifest, effective command-line overrides, resolved config, and Git revision in `metadata/train_config.yaml`.
 
 Python changes are still required when adding a new model implementation, data config factory, or robot transform.
+
+For multi-source robot-data pretraining rather than fine-tuning, use the separate
+[π0.5 RLDS pretraining pipeline](docs/pretraining.md). It provides standalone strict YAML configs, temperature-adjusted
+sample-level mixtures, source adapters, padded-action masks, per-source validation, statistical data-stream resume, and
+native JAX multi-host execution.
 
 The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
 

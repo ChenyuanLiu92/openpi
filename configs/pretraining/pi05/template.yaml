@@ -1,0 +1,286 @@
+# OpenPI π0.5 预训练完整、独立配置模板
+#
+# 这个文件不继承 config.py，也不执行任意 Python。所有字段均由严格 schema 校验；
+# 未知字段、缺少字段和重复 YAML key 都会直接报错。
+#
+# 推荐目录：
+#   configs/pretraining/pi05/<项目>/<实验>.yaml
+#
+# 使用流程：
+#   1. 复制本文件，修改实验名、RLDS 数据源字段映射、路径和训练超参数。
+#   2. 计算每个 normalization_id 的统计量：
+#      uv run --group rlds scripts/compute_pretrain_norm_stats.py \
+#        configs/pretraining/pi05/<实验>.yaml \
+#        --max-frames-per-normalization 1000000
+#   3. 启动训练：
+#      uv run --group rlds scripts/pretrain.py configs/pretraining/pi05/<实验>.yaml
+#   4. 临时覆盖 YAML 值（tyro 会把下划线参数显示为连字符）：
+#      uv run --group rlds scripts/pretrain.py configs/pretraining/pi05/<实验>.yaml \
+#        --exp-name lr_ablation --optimizer.clip-gradient-norm 0.5
+
+# schema 版本；当前只支持 1。
+schema_version: 1
+
+# 配置种类；预训练入口只接受 pi05_pretrain。
+kind: pi05_pretrain
+
+# 预训练配方名称。资产目录为 <assets_base_dir>/<name>，checkpoint 目录为
+# <checkpoint_base_dir>/<name>/<exp_name>。
+name: pi05_rlds_pretrain
+
+# π0.5 模型的全部 Pi0Config 字段。
+model:
+  # π0.5 仍由 pi0 模型类承载，目前预训练不支持 pi0_fast。
+  type: pi0
+
+  # 模型矩阵计算和 embedding dtype。
+  dtype: bfloat16
+
+  # PaliGemma 视觉语言主干；预训练必须使用非 LoRA 变体。
+  paligemma_variant: gemma_2b
+
+  # flow-matching 动作专家；预训练必须使用非 LoRA 变体。
+  action_expert_variant: gemma_300m
+
+  # 模型统一 state/action 维度。各数据源不足的维度会补零，并用 action_mask 排除 loss。
+  action_dim: 32
+
+  # 每个样本预测的未来动作步数。
+  action_horizon: 50
+
+  # prompt 加离散 state 的最大 token 长度。
+  max_token_len: 200
+
+  # 必须为 true，启用 π0.5 架构。
+  pi05: true
+
+  # π0.5 预训练把 state 离散化后放进语言 token，通常保持 true。
+  discrete_state_input: true
+
+  # 仅 PyTorch 推理的 torch.compile 模式；JAX 训练不读取，但属于完整模型配置。
+  # 可选 default、reduce-overhead、max-autotune、max-autotune-no-cudagraphs 或 null。
+  pytorch_compile_mode: max-autotune
+
+# 初始化方式的全部字段。
+initialization:
+  # paligemma：只加载官方 PaliGemma 参数，其余 π0.5 参数随机初始化。
+  # pi05_checkpoint：加载一个完整 π0.5 params checkpoint，可用于继续预训练/二阶段训练。
+  type: paligemma
+
+  # type=paligemma 时必须为 null；type=pi05_checkpoint 时必须填写本地或 gs:// params 路径，
+  # 例如 gs://openpi-assets/checkpoints/pi05_base/params。
+  params_path: null
+
+# RLDS/TFDS sample-level 混合数据配置的全部字段。
+data:
+  # 当前唯一支持的数据后端。
+  type: rlds_mixture
+
+  # 温度采样：source 概率 p_i = weight_i^(1/temperature) / Σ。
+  # 1.0 保持原始权重；小于 1 强化大权重；大于 1 让各数据源更均衡。
+  temperature: 1.0
+
+  # 每个 host、每个 source 在 repeat 后的 shuffle buffer（以 frame/sample 为单位）。
+  shuffle_buffer_size: 100000
+
+  # TFDS 并行读取数；-1 表示 tf.data.AUTOTUNE，正整数表示固定并行度。
+  num_parallel_reads: -1
+
+  # trajectory adapter/map/flatten 的并行调用数；-1 表示 AUTOTUNE。
+  num_parallel_calls: -1
+
+  # batch 后预取的 batch 数，必须为正整数。
+  prefetch_batches: 4
+
+  # 所有数据源。需要混训时复制整个 “- id: ...” block；id 必须唯一。
+  sources:
+    # source 的稳定 ID，用于日志、恢复时的消费计数和验证指标。
+    - id: example_robot
+
+      # 传给 tfds.builder 的 builder 名称。数据必须已经注册/转换为 RLDS/TFDS。
+      tfds_name: example_robot_dataset
+
+      # TFDS builder 版本。
+      version: 1.0.0
+
+      # TFDS data_dir；可以让多个 source 指向同一根目录。
+      data_dir: /mnt/bos/dataset/rlds
+
+      # TFDS 训练 split，支持 train、train[:95%] 等 ReadInstruction 字符串。
+      train_split: train[:95%]
+
+      # 独立验证 split；训练过程中会按 source 分别报告 loss。
+      validation_split: train[95%:]
+
+      # 未经温度变换的正采样权重。
+      weight: 1.0
+
+      # 归一化统计资产 ID，路径为 <assets_base_dir>/<name>/<normalization_id>。
+      # 多个 source 可共享 ID，但共享时 state_dim 和 action_dim 必须一致；统计量会按混合概率合并。
+      normalization_id: example_robot_v1
+
+      # action chunk 中相邻动作的原始数据时间步间隔；1 表示连续未来动作。
+      action_stride: 1
+
+      # adapter 拼接后的真实 state 维度，必须 <= model.action_dim。
+      state_dim: 8
+
+      # adapter 拼接后的真实 action 维度，必须 <= model.action_dim。
+      action_dim: 8
+
+      # 安全 adapter 注册表配置。不能在 YAML 中写 Python import/callable。
+      adapter:
+        # field_map 用声明式路径读取常见 RLDS 字段；复杂数据集可在
+        # openpi.training.rlds_adapters 中注册经过代码审查的新 adapter 名称。
+        type: field_map
+
+        # field_map 的全部必填选项。
+        options:
+          # 把原始图像字段映射到 OpenPI 三个固定相机槽位。
+          images:
+            # 主相机必填，支持 “observation/image” 形式的嵌套路径，也支持包含 / 的字面 key。
+            base_0_rgb: observation/image
+
+            # 缺少某个腕部相机时写 null；loader 会补零图像并把 image_mask 设为 false。
+            left_wrist_0_rgb: observation/wrist_image
+            right_wrist_0_rgb: null
+
+          # state 字段路径列表；多项会按最后一维依次拼接，总维度必须等于 state_dim。
+          state:
+            - observation/state
+
+          # action 字段路径列表；多项会按最后一维依次拼接，总维度必须等于 action_dim。
+          actions:
+            - action
+
+          # 语言指令路径。可以是每条 trajectory 一个 scalar string，或每个时间步一个 [T] string。
+          prompt: task/language_instruction
+
+          # 原始图像数值范围：uint8=[0,255]、zero_one=[0,1]、minus_one_one=[-1,1]。
+          image_range: uint8
+
+# 学习率调度器的全部字段。
+lr_schedule:
+  # 可选 cosine_decay 或 rsqrt_decay；不同类型所需字段不同。本模板完整展示 cosine_decay。
+  type: cosine_decay
+
+  # 从近零学习率线性 warmup 到 peak_lr 的 optimizer step 数。
+  warmup_steps: 10000
+
+  # 峰值学习率。
+  peak_lr: 0.00005
+
+  # 从训练开始计的 warmup+cosine 总步数；通常与 num_train_steps 一致。
+  decay_steps: 1000000
+
+  # cosine 结束时的学习率。
+  decay_lr: 0.000005
+
+# 优化器的全部字段。
+optimizer:
+  # 可选 adamw 或 sgd；大规模 π0.5 预训练推荐 adamw。
+  type: adamw
+
+  # Adam 一阶矩衰减。
+  b1: 0.9
+
+  # Adam 二阶矩衰减。
+  b2: 0.95
+
+  # 数值稳定项。
+  eps: 0.00000001
+
+  # 解耦 weight decay。设为极小非零值可保持与 OpenPI 默认优化器一致。
+  weight_decay: 0.0000000001
+
+  # 全局梯度范数裁剪阈值。
+  clip_gradient_norm: 1.0
+
+# 训练循环的全部字段。
+training:
+  # 模型、flow matching 和 RLDS shuffle 的基础随机种子。
+  seed: 42
+
+  # 所有 host/device 合计的全局 batch size，必须能被全局 JAX device 数整除。
+  batch_size: 256
+
+  # optimizer 更新总步数。
+  num_train_steps: 1000000
+
+  # 参数 EMA 系数；null 表示关闭。checkpoint 会同时精确恢复 EMA。
+  ema_decay: 0.999
+
+# 本机或共享文件系统路径。相对路径以启动脚本时的工作目录解析。
+paths:
+  # normalization stats 根目录；实际目录还会拼接 name/normalization_id。
+  assets_base_dir: ./assets/pretraining
+
+  # checkpoint 根目录；实际目录还会拼接 name/exp_name。
+  checkpoint_base_dir: ./checkpoints/pretraining
+
+# checkpoint/run 的全部字段。
+checkpoint:
+  # 本次运行名，对应 checkpoint 路径中的 <exp_name>，因此不需要再从命令行传。
+  exp_name: baseline
+
+  # 每多少个已完成 optimizer step 保存一次；最后一步一定保存。
+  save_interval: 1000
+
+  # 被该值整除的 checkpoint 永久保留；null 表示仅保留最新 checkpoint。
+  keep_period: 10000
+
+  # true 会清空同名 checkpoint 目录。不要和 resume 同时打开。
+  overwrite: false
+
+  # true 从最新 checkpoint 精确恢复 model/optimizer/EMA/step；数据流按记录计数做统计恢复。
+  resume: false
+
+# 日志的全部字段。
+logging:
+  # W&B project 名称。
+  project_name: openpi-pretraining
+
+  # 是否启用 W&B；false 时仍输出本地 tqdm/log。
+  wandb_enabled: true
+
+  # 多少 optimizer step 聚合并记录一次训练指标。
+  log_interval: 100
+
+# 原生 JAX 单机/多机配置的全部字段。
+distributed:
+  # FSDP 轴设备数。1 表示参数不分片；必须整除全局 device 数。
+  fsdp_devices: 1
+
+  # 单机由 launcher 已完成初始化时保持 false；原生多 host 且 launcher 未初始化时设 true。
+  initialize: false
+
+  # 显式多 host 初始化的 coordinator “host:port”；使用自动集群检测时写 null。
+  coordinator_address: null
+
+  # 多 host 总进程数；使用自动集群检测时写 null。
+  num_processes: null
+
+  # 当前进程的全局 ID（从 0 开始）；使用自动集群检测时写 null。
+  process_id: null
+
+  # 当前进程可使用的本地 device ID；null 表示使用 launcher/JAX 默认值。
+  local_device_ids: null
+
+  # JAX 自动集群检测方法，例如 mpi4py、slurm；显式填写上述三项时写 null。
+  cluster_detection_method: null
+
+  # jax.distributed.initialize 超时时间，单位秒。
+  initialization_timeout: 300
+
+# validation 的全部字段。
+validation:
+  # 每多少训练 step 运行一次逐 source validation。
+  interval_steps: 1000
+
+  # 每个 source 每次验证读取多少个完整 global batch。
+  batches_per_source: 10
+
+# 会记录进 resolved snapshot，供部署/评估工具使用的自定义 JSON/YAML 元数据。
+policy_metadata:
+  model_family: pi0.5
+  training_stage: pretraining
