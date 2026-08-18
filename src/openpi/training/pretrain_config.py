@@ -88,6 +88,7 @@ class DistributedConfig:
     """Single-host FSDP and optional native JAX multi-host initialization."""
 
     fsdp_devices: int
+    warmup_collectives: bool
     initialize: bool
     coordinator_address: str | None
     num_processes: int | None

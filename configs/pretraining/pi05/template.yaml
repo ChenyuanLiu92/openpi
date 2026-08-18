@@ -251,6 +251,11 @@ distributed:
   # FSDP 轴设备数。1 表示参数不分片；必须整除全局 device 数。
   fsdp_devices: 1
 
+  # 是否在加载大模型/checkpoint 前运行一次带数值校验的本机 JAX AllReduce、AllGather 和 ReduceScatter。
+  # 推荐保持 true：新 GPU 架构或空 CUDA driver cache 上第一次 NCCL/PTX JIT 可能耗时几十秒；
+  # 此时 XLA 在 10 秒后打印的 “rendezvous ... may be stuck” 是进度告警，不等于死锁。
+  warmup_collectives: true
+
   # 单机由 launcher 已完成初始化时保持 false；原生多 host 且 launcher 未初始化时设 true。
   initialize: false
 

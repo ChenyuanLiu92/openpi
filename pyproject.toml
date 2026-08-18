@@ -64,7 +64,9 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+# torch 2.7.1 pins NCCL 2.26.2, whose AllGather kernel crashes on sm_120 GPUs.
+# NCCL 2.28.9 remains ABI-compatible and adds the required Blackwell fixes.
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "nvidia-nccl-cu12==2.28.9"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }

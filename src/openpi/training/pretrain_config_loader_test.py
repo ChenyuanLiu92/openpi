@@ -21,6 +21,7 @@ def test_complete_pi05_pretrain_template_is_valid():
     assert resolved.config.name == "pi05_rlds_pretrain"
     assert resolved.config.model.pi05 is True
     assert resolved.config.exp_name == "baseline"
+    assert resolved.config.distributed.warmup_collectives is True
     assert resolved.config.data.effective_probabilities() == (1.0,)
     assert (
         resolved.config.checkpoint_dir == pathlib.Path("checkpoints/pretraining/pi05_rlds_pretrain/baseline").resolve()
@@ -32,12 +33,22 @@ def test_complete_pi05_pretrain_template_is_valid():
 
 def test_pretrain_config_supports_cli_overrides():
     resolved = pretrain_config_loader.parse_cli(
-        [str(_template_path()), "--exp-name", "lr_test", "--batch-size", "8", "--data.temperature", "2.0"]
+        [
+            str(_template_path()),
+            "--exp-name",
+            "lr_test",
+            "--batch-size",
+            "8",
+            "--data.temperature",
+            "2.0",
+            "--distributed.no-warmup-collectives",
+        ]
     )
 
     assert resolved.config.exp_name == "lr_test"
     assert resolved.config.batch_size == 8
     assert resolved.config.data.temperature == 2.0
+    assert resolved.config.distributed.warmup_collectives is False
     assert resolved.manifest["checkpoint"]["exp_name"] == "baseline"
 
 

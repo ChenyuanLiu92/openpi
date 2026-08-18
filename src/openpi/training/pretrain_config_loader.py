@@ -197,6 +197,7 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         "distributed",
         {
             "fsdp_devices",
+            "warmup_collectives",
             "initialize",
             "coordinator_address",
             "num_processes",
@@ -253,6 +254,7 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         ),
         distributed=_config.DistributedConfig(
             fsdp_devices=_integer(distributed["fsdp_devices"], "distributed.fsdp_devices"),
+            warmup_collectives=_boolean(distributed["warmup_collectives"], "distributed.warmup_collectives"),
             initialize=_boolean(distributed["initialize"], "distributed.initialize"),
             coordinator_address=_nullable_string(distributed["coordinator_address"], "distributed.coordinator_address"),
             num_processes=_nullable_integer(distributed["num_processes"], "distributed.num_processes"),

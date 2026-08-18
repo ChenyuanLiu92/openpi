@@ -20,6 +20,7 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 from openpi.training import checkpoints
+from openpi.training import gpu_collectives
 from openpi.training import pretrain_config
 from openpi.training import pretrain_config_loader
 from openpi.training import rlds_mixture
@@ -166,6 +167,7 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
     rng = jax.random.key(config.seed)
     train_rng, init_rng, validation_rng = jax.random.split(rng, 3)
     mesh = sharding.make_mesh(config.fsdp_devices)
+    gpu_collectives.warmup_local_collectives(enabled=config.distributed.warmup_collectives)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 

@@ -69,6 +69,30 @@ uv run --group rlds scripts/pretrain.py \
   configs/pretraining/pi05/embodiment_mix/baseline.yaml
 ```
 
+在新 GPU 架构或空 CUDA driver cache 上，第一次 NCCL collective 可能触发 PTX JIT，耗时几十秒。建议把缓存放到
+持久且可写的目录，并在正式训练前运行数值校验脚本：
+
+```bash
+mkdir -p /mnt/pfs/rhos-vla/chenyuan/.cache/openpi-cuda
+CUDA_CACHE_PATH=/mnt/pfs/rhos-vla/chenyuan/.cache/openpi-cuda \
+CUDA_CACHE_MAXSIZE=4294967296 \
+uv run scripts/check_gpu_collectives.py \
+  --visible-devices 4,5,6,7 \
+  --expected-device-count 4
+```
+
+脚本会连续执行两次小型 `AllReduce`、`AllGather` 和 `ReduceScatter` 并核对结果：第一次包含冷编译，第二次反映热缓存速度。
+这些操作覆盖 FSDP 的关键通信路径；例如 AllReduce 正常并不能证明 AllGather 正常。训练入口也会在加载模型
+和 checkpoint 前执行同样的轻量预热，由 `distributed.warmup_collectives` 控制。推荐保持 `true`；只有一个本地 device
+时会自动跳过。独立诊断脚本默认设置 `XLA_PYTHON_CLIENT_PREALLOCATE=false`，不会为这个小探针预占训练规模的显存。
+若冷启动期间 XLA 在 10 秒后输出 `rendezvous ... may be stuck`，先等待该数值校验完成；只有校验最终
+报错或长期不返回时，才按实际 JAX/NCCL 通信故障排查。不要设置 `CUDA_CACHE_DISABLE=1`，并确保
+`CUDA_CACHE_PATH` 可写。
+
+本项目通过 `uv` 将 `nvidia-nccl-cu12` 固定为 2.28.9。不要降回 PyTorch 2.7.1 元数据中的 2.26.2：该版本在本机
+sm_120 GPU 上可通过 AllReduce，却会在 AllGather 触发 `CUDA_ERROR_ILLEGAL_ADDRESS`。依赖安装应使用 `uv sync`，
+保证 `uv.lock` 中的 NCCL override 生效。
+
 初始化方式由 YAML 决定：
 
 - `paligemma`：加载 PaliGemma 参数，其余 π0.5 参数随机初始化。
@@ -87,6 +111,7 @@ checkpoint 精确保存和恢复模型参数、optimizer、EMA 与 step，同时
 ```yaml
 distributed:
   fsdp_devices: 8
+  warmup_collectives: true
   initialize: true
   coordinator_address: host0.example:12345
   num_processes: 4
