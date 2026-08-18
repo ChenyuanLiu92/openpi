@@ -164,7 +164,8 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-nam
 
 For a new experiment that uses an existing model and robot transform, you do not need to edit
 `src/openpi/training/config.py`. Add a versioned YAML file under `configs/experiments/` that extends a built-in
-configuration:
+configuration. See [`pi05_template.yaml`](configs/experiments/pi05_template.yaml) for a fully annotated π0.5
+template containing every declarative training field:
 
 ```yaml
 schema_version: 1

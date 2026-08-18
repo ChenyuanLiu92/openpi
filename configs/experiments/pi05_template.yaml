@@ -1,0 +1,214 @@
+# OpenPI π0.5 完整实验配置模板
+#
+# 使用方法：
+#   1. 复制本文件并修改 name、数据集、权重和超参数。
+#   2. 计算归一化统计：
+#      uv run scripts/compute_norm_stats.py --config configs/experiments/<your_config>.yaml
+#   3. 启动训练：
+#      uv run scripts/train.py configs/experiments/<your_config>.yaml \
+#        --exp-name=<run_name> --overwrite
+#
+# YAML 只负责描述可复用的实验配方。exp_name、resume、overwrite 和本机目录属于
+# 单次运行参数，必须通过命令行传入；本文件末尾完整列出了这些运行时字段。
+
+# YAML schema 版本。目前只支持版本 1。
+schema_version: 1
+
+# 配置名称。用于 assets/<name>/ 和 checkpoints/<name>/ 的目录层级；仓库内应保持唯一。
+name: pi05_template
+
+# 继承的 Python 基础配方。本模板以 π0.5 在 LIBERO 上的配置为例。
+# YAML overrides 只能修改该基础配方已有字段，不能从 YAML 动态执行或导入 Python 代码。
+base: pi05_libero
+
+# 对基础配方的完整声明式覆盖。
+overrides:
+  # W&B project 名称。
+  project_name: openpi
+
+  # 模型结构配置。base=pi05_libero 对应 Pi0Config(pi05=True)。
+  model:
+    # 模型内部统一动作维度。真实机器人动作不足该维度时，数据管线会 padding。
+    action_dim: 32
+
+    # 每次预测的未来动作数量，即 action chunk 长度。
+    action_horizon: 10
+
+    # 语言/离散状态 token 的最大长度；π0.5 默认使用 200。
+    max_token_len: 200
+
+    # JAX 模型内部矩阵计算和 embedding 使用的 dtype。
+    dtype: bfloat16
+
+    # 图像语言主干的 Gemma 变体。LoRA 微调可改为 gemma_2b_lora，
+    # 但 freeze_filter 仍需要在对应 Python 基础配方中定义。
+    paligemma_variant: gemma_2b
+
+    # 动作专家的 Gemma 变体。
+    action_expert_variant: gemma_300m
+
+    # true 表示使用 π0.5；false 表示使用 π0。
+    pi05: true
+
+    # 是否把机器人 state 离散化并放入语言 token。
+    # 当前官方 pi05_libero 配方为 false，因此保留连续 state 输入。
+    discrete_state_input: false
+
+    # PyTorch 推理使用的 torch.compile 模式；可选 default、reduce-overhead、
+    # max-autotune、max-autotune-no-cudagraphs。JAX 训练不使用该字段。
+    pytorch_compile_mode: max-autotune
+
+  # 初始化权重。params_path 可指向本地路径或 gs:// checkpoint 的 params 目录。
+  weight_loader:
+    params_path: gs://openpi-assets/checkpoints/pi05_base/params
+
+  # PyTorch 微调时加载的已转换 safetensors checkpoint 目录。
+  # JAX 训练忽略该字段；使用 PyTorch 前必须替换成真实路径。
+  pytorch_weight_path: /path/to/your/pytorch_weight_path
+
+  # PyTorch 训练精度，可选 bfloat16 或 float32；当前不支持混合精度。
+  pytorch_training_precision: bfloat16
+
+  # 学习率调度。当前基础配方使用带 warmup 的 cosine schedule。
+  lr_schedule:
+    # 从初始学习率升到 peak_lr 所需的 step 数。
+    warmup_steps: 10000
+
+    # warmup 结束后的峰值学习率。
+    peak_lr: 0.00005
+
+    # cosine decay 的总 step 数；大于 num_train_steps 时，训练期间只走前半段。
+    decay_steps: 1000000
+
+    # decay 结束时的最终学习率。
+    decay_lr: 0.00005
+
+  # AdamW 优化器配置。
+  optimizer:
+    # 一阶动量衰减系数。
+    b1: 0.9
+
+    # 二阶动量衰减系数。
+    b2: 0.95
+
+    # 数值稳定项。
+    eps: 0.00000001
+
+    # AdamW weight decay。官方默认使用接近零的值。
+    weight_decay: 0.0000000001
+
+    # 全局梯度范数裁剪阈值。
+    clip_gradient_norm: 1.0
+
+  # JAX 参数指数滑动平均系数；设得越接近 1，平滑窗口越长。
+  # PyTorch trainer 当前不支持 EMA。
+  ema_decay: 0.999
+
+  # 数据集与机器人数据适配配置。这里的具体类型是 LeRobotLiberoDataConfig。
+  data:
+    # Hugging Face/LeRobot dataset repo id，也可以是 LeRobot 支持的本地 repo id。
+    repo_id: physical-intelligence/libero
+
+    # 归一化统计等数据资产的来源。
+    assets:
+      # null 表示从 assets_base_dir/name 下读取；若复用预训练统计，可填写
+      # gs://openpi-assets/checkpoints/<checkpoint>/assets。
+      assets_dir: null
+
+      # 资产子目录 ID。null 时自动使用 repo_id。
+      asset_id: null
+
+    # DataConfigFactory 创建最终 DataConfig 前使用的基础数据选项。
+    base_config:
+      # true 表示使用 LeRobot dataset 的 task 字段作为语言 prompt。
+      prompt_from_task: true
+
+      # DataConfig 其余字段由 LeRobotLiberoDataConfig.create() 生成，不应在实验 YAML
+      # 中手写。这里逐项说明，避免误以为配置缺失：
+      #
+      # repo_id
+      #   最终数据集 ID；由外层 data.repo_id 覆盖。
+      # asset_id
+      #   最终 normalization asset ID；由 data.assets 和 repo_id 推导。
+      # norm_stats
+      #   state/actions 归一化统计；从 assets_dir/asset_id 自动加载。
+      # repack_transforms
+      #   将 LIBERO dataset 字段重命名到 policy 输入字段的 Python transform。
+      # data_transforms
+      #   LIBERO state/image/action 与统一 Observation/Actions 之间的 Python transform。
+      # model_transforms
+      #   resize、tokenize、padding 等由模型类型决定的 Python transform。
+      # use_quantile_norm
+      #   是否使用 quantile normalization；create_base_config 根据模型类型设置，
+      #   π0.5 为 true。
+      # action_sequence_keys
+      #   LeRobot 生成 action chunk 时读取的字段；LIBERO 默认是 [actions]。
+      # rlds_data_dir
+      #   RLDS 数据根目录；仅 DROID/RLDS 配方使用，并且属于命令行运行时字段。
+      # action_space
+      #   DROID action space enum；LIBERO 不使用。
+      # datasets
+      #   RLDS 多数据集及采样权重列表；LIBERO 不使用。
+
+    # LIBERO 原始 action 已经是 delta action。只有复现使用额外 delta 变换的旧 π0
+    # checkpoint 时才设为 true；π0.5 默认保持 false。
+    extra_delta_transform: false
+
+  # 随机种子，用于模型初始化、数据 shuffle 和训练随机数。
+  seed: 42
+
+  # 全局 batch size。必须能被 JAX device 数或 PyTorch DDP world size 整除。
+  batch_size: 256
+
+  # PyTorch DataLoader 的 CPU worker 数。增大可提高读取速度，但会增加内存占用。
+  num_workers: 2
+
+  # 优化器更新总 step 数。
+  num_train_steps: 30000
+
+  # 每隔多少 step 输出并上传一次聚合训练指标。
+  log_interval: 100
+
+  # 每隔多少 step 保存一次 checkpoint；最后一个 step 总会保存。
+  save_interval: 1000
+
+  # 即使超过 max_to_keep，也永久保留 step 能被该值整除的 checkpoint。
+  keep_period: 5000
+
+  # 是否启用 Weights & Biases。离线训练时可设为 false。
+  wandb_enabled: true
+
+  # 随 checkpoint/policy server 暴露的自定义元数据；不需要时使用空 mapping。
+  policy_metadata: {}
+
+  # JAX FSDP 每个模型分片组使用的设备数。1 表示不分片，只做数据并行；
+  # 该值必须整除总设备数。PyTorch trainer 不使用此字段。
+  fsdp_devices: 1
+
+  # freeze_filter 没有出现在 YAML 中：它是 Flax NNX 的 Python filter 对象，不能安全地
+  # 从静态 YAML 构造。全量微调沿用 pi05_libero 的“不冻结参数”；LoRA 请继承一个已经
+  # 在 Python 中定义好 freeze_filter 的 LoRA 基础配方。
+
+# -----------------------------------------------------------------------------
+# 以下也是 TrainConfig 的完整字段，但属于单次运行或本机环境，不能写入 overrides。
+# 它们保留为注释，取消注释会被 loader 拒绝并提示使用命令行。
+#
+# exp_name: baseline
+#   本次 run 名称；命令行：--exp-name=baseline
+#
+# overwrite: false
+#   checkpoint 目录存在时是否清空重训；命令行：--overwrite
+#
+# resume: false
+#   是否从已有目录的最新 checkpoint 恢复；命令行：--resume
+#   overwrite 和 resume 不能同时为 true。
+#
+# assets_base_dir: ./assets
+#   本机 normalization assets 根目录；命令行：--assets-base-dir=/path/to/assets
+#
+# checkpoint_base_dir: ./checkpoints
+#   本机 checkpoint 根目录；命令行：--checkpoint-base-dir=/path/to/checkpoints
+#
+# data.rlds_data_dir: /path/to/rlds
+#   仅 RLDS/DROID DataConfig 使用的本机数据路径；LIBERO/LeRobot 不使用。
+#   对 RLDS 基础配方可用命令行：--data.rlds-data-dir=/path/to/rlds
