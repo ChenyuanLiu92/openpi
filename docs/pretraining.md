@@ -105,8 +105,43 @@ checkpoint 精确保存和恢复模型参数、optimizer、EMA 与 step，同时
 
 ## 单机与原生 JAX 多机
 
-单机多卡只需设置全局 `batch_size` 和 `distributed.fsdp_devices`。多机应在每个 host 上使用同一共享 checkpoint 目录和配置，
-并在首次访问 JAX device 前初始化集群。可以在 YAML 中显式设置：
+单机多卡只需设置全局 `batch_size` 和 `distributed.fsdp_devices`。开发时可以在一台 8 卡机器上用两个 JAX rank
+模拟两个节点；每个 rank 只看到自己的四张卡，但共同建立一个 8-device global mesh：
+
+```bash
+uv run --group rlds scripts/launch_pretrain.py local \
+  configs/pretraining/pi05/<项目>/<实验>.yaml \
+  --device-group 0,1,2,3 \
+  --device-group 4,5,6,7
+```
+
+先加 `--probe-only` 可以只运行本地和跨 rank 的 AllReduce、AllGather、ReduceScatter 数值检查，不加载 RLDS 或模型。
+launcher 自动选择 loopback coordinator 端口、为每个 rank 保存独立日志，并在任一 rank 失败时回收自己启动的其他 rank。
+训练参数仍可放在 `--` 后临时覆盖；`--distributed.*` 参数由 launcher 独占，不能通过 passthrough 重复设置：
+
+```bash
+uv run --group rlds scripts/launch_pretrain.py local <config.yaml> \
+  --device-group 0,1,2,3 --device-group 4,5,6,7 -- \
+  --batch-size 8 --num-train-steps 2
+```
+
+真实多机不由本脚本执行 SSH。Slurm、Kubernetes 或人工 SSH 在每个节点分别运行 `rank`，所有节点使用完全相同的 YAML
+和共享 checkpoint 路径，只改变运行时 rank：
+
+```bash
+# node 0
+uv run --group rlds scripts/launch_pretrain.py rank <config.yaml> \
+  --coordinator-address 10.0.0.1:12345 --coordinator-bind-address '[::]:12345' \
+  --num-processes 2 --process-id 0 --local-device-ids 0,1,2,3,4,5,6,7
+
+# node 1
+uv run --group rlds scripts/launch_pretrain.py rank <config.yaml> \
+  --coordinator-address 10.0.0.1:12345 \
+  --num-processes 2 --process-id 1 --local-device-ids 0,1,2,3,4,5,6,7
+```
+
+上述 launcher 用法要求 YAML 中 `distributed.initialize: false`，coordinator/rank/device 字段保持 `null`；launcher 会在进入
+训练入口前注入完整参数。也可以不使用 launcher，在每个 host 的 YAML/CLI 中显式设置：
 
 ```yaml
 distributed:
@@ -114,13 +149,30 @@ distributed:
   warmup_collectives: true
   initialize: true
   coordinator_address: host0.example:12345
+  coordinator_bind_address: null
   num_processes: 4
   process_id: 0  # 每个 host 不同
-  local_device_ids: null
+  local_device_ids: [0, 1, 2, 3, 4, 5, 6, 7]
   cluster_detection_method: null
   initialization_timeout: 300
 ```
 
-在 Slurm/MPI 等 JAX 可自动检测的环境，可以把 coordinator/进程字段保持 `null` 并设置相应
+在 Slurm/MPI 等 JAX 可自动检测的环境，可以把 coordinator/进程/device 字段保持 `null` 并设置相应
 `cluster_detection_method`。全局 batch size 必须能被全局 device 数整除。TFDS 会先按 process shard，之后各 host
 共同构造全局 JAX array；Orbax checkpoint 和 W&B 写入仅由 process 0 负责。
+
+多网卡真实节点可通过 `coordinator_bind_address` 控制 process 0 的监听接口，并按集群实际网络设置
+`NCCL_SOCKET_IFNAME`、`NCCL_IB_HCA`。本机双 rank 测试只能验证 JAX 多进程、跨 rank NCCL 和训练语义，不能替代真实
+IB/RoCE 链路验收。
+
+仓库提供可重复的完整模型 smoke test。它会在一个全新的 PFS 目录生成两个 mock RLDS source，依次执行跨 rank 通信探针、
+完整 `gemma_2b + gemma_300m` step 1 保存和 resume 到 step 2，并核对数据消费计数、有限 loss/grad 和 rank 日志：
+
+```bash
+uv run --group rlds scripts/multinode_pretrain_smoke.py \
+  --work-dir /mnt/pfs/path/to/new-smoke-directory \
+  --wait-for-memory-seconds 3600
+```
+
+默认要求 cgroup 至少有 140 GiB 可用主存，并在使用率达到 95% 时只停止本次启动的 rank。smoke test 不会删除或复用已有目录，
+也不会终止机器上的其他进程。

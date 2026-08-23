@@ -1,5 +1,8 @@
 import logging
+import os
 import pathlib
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -27,12 +30,81 @@ def test_probe_requires_multiple_devices():
         gpu_collectives.run_local_fsdp_collective_probe(devices=(_FakeDevice(),), require_multiple_devices=True)
 
 
+@pytest.mark.parametrize(
+    ("value", "divisor", "expected"),
+    [(1024, 2, 1024), (1024, 3, 1026), (1024, 4, 1024), (1024, 6, 1026), (1024, 8, 1024)],
+)
+def test_round_up_to_multiple(value: int, divisor: int, expected: int):
+    assert gpu_collectives._round_up_to_multiple(value, divisor) == expected  # noqa: SLF001
+
+
+def test_probe_supports_three_devices():
+    env = {
+        **os.environ,
+        "JAX_PLATFORMS": "cpu",
+        "XLA_FLAGS": "--xla_force_host_platform_device_count=3",
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from openpi.training import gpu_collectives as g; "
+                "g.run_local_fsdp_collective_probe(repetitions=1, require_multiple_devices=True)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_global_probe_supports_single_process_cpu_mesh():
+    env = {
+        **os.environ,
+        "JAX_PLATFORMS": "cpu",
+        "XLA_FLAGS": "--xla_force_host_platform_device_count=2",
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from openpi.training import gpu_collectives as g, sharding as s; "
+                "g.run_global_collective_probe(s.make_mesh(2), repetitions=1)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_validate_collective_results_rejects_wrong_all_reduce():
     with pytest.raises(RuntimeError, match="AllReduce produced"):
         gpu_collectives._validate_collective_results(  # noqa: SLF001
             np.array([0.0, 0.0], dtype=np.float32),
             np.empty((2, 4, 1), dtype=np.float32),
             np.empty((2, 1, 1), dtype=np.float32),
+            expected_sum=1.0,
+            device_count=2,
+            payload_rows=2,
+            payload_columns=1,
+        )
+
+
+def test_validate_global_collective_results_rejects_wrong_all_reduce():
+    with pytest.raises(RuntimeError, match="Global AllReduce"):
+        gpu_collectives._validate_global_collective_results(  # noqa: SLF001
+            np.asarray(0.0, dtype=np.float32),
+            np.empty((4, 1), dtype=np.float32),
+            np.empty((2, 1), dtype=np.float32),
             expected_sum=1.0,
             device_count=2,
             payload_rows=2,

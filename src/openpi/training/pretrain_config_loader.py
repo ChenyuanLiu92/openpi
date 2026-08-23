@@ -192,28 +192,25 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         nullable={"keep_period"},
     )
     logging_config = _section(contents["logging"], "logging", {"project_name", "wandb_enabled", "log_interval"})
-    distributed = _section(
-        contents["distributed"],
+    distributed_required = {
+        "fsdp_devices",
+        "warmup_collectives",
+        "initialize",
+        "coordinator_address",
+        "num_processes",
+        "process_id",
+        "local_device_ids",
+        "cluster_detection_method",
+        "initialization_timeout",
+    }
+    distributed_payload = dict(_mapping(contents["distributed"], "distributed"))
+    _check_keys(
+        distributed_payload,
+        distributed_required | {"coordinator_bind_address"},
+        distributed_required,
         "distributed",
-        {
-            "fsdp_devices",
-            "warmup_collectives",
-            "initialize",
-            "coordinator_address",
-            "num_processes",
-            "process_id",
-            "local_device_ids",
-            "cluster_detection_method",
-            "initialization_timeout",
-        },
-        nullable={
-            "coordinator_address",
-            "num_processes",
-            "process_id",
-            "local_device_ids",
-            "cluster_detection_method",
-        },
     )
+    distributed = {"coordinator_bind_address": None, **distributed_payload}
     validation = _section(contents["validation"], "validation", {"interval_steps", "batches_per_source"})
     local_device_ids = distributed["local_device_ids"]
     if local_device_ids is not None:
@@ -257,6 +254,9 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
             warmup_collectives=_boolean(distributed["warmup_collectives"], "distributed.warmup_collectives"),
             initialize=_boolean(distributed["initialize"], "distributed.initialize"),
             coordinator_address=_nullable_string(distributed["coordinator_address"], "distributed.coordinator_address"),
+            coordinator_bind_address=_nullable_string(
+                distributed["coordinator_bind_address"], "distributed.coordinator_bind_address"
+            ),
             num_processes=_nullable_integer(distributed["num_processes"], "distributed.num_processes"),
             process_id=_nullable_integer(distributed["process_id"], "distributed.process_id"),
             local_device_ids=local_device_ids,

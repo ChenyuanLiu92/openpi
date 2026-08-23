@@ -251,7 +251,8 @@ distributed:
   # FSDP 轴设备数。1 表示参数不分片；必须整除全局 device 数。
   fsdp_devices: 1
 
-  # 是否在加载大模型/checkpoint 前运行一次带数值校验的本机 JAX AllReduce、AllGather 和 ReduceScatter。
+  # 是否在加载大模型/checkpoint 前运行一次带数值校验的 JAX AllReduce、AllGather 和 ReduceScatter。
+  # 多进程时先检查每个 rank 的本地设备，再检查覆盖整个 global mesh 的跨 rank collective。
   # 推荐保持 true：新 GPU 架构或空 CUDA driver cache 上第一次 NCCL/PTX JIT 可能耗时几十秒；
   # 此时 XLA 在 10 秒后打印的 “rendezvous ... may be stuck” 是进度告警，不等于死锁。
   warmup_collectives: true
@@ -261,6 +262,9 @@ distributed:
 
   # 显式多 host 初始化的 coordinator “host:port”；使用自动集群检测时写 null。
   coordinator_address: null
+
+  # coordinator 在 process 0 上监听的地址；多网卡节点可写 [::]:12345 或指定内网 IP，通常保持 null。
+  coordinator_bind_address: null
 
   # 多 host 总进程数；使用自动集群检测时写 null。
   num_processes: null

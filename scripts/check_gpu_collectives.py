@@ -25,11 +25,27 @@ def _parse_args() -> argparse.Namespace:
         default=2,
         help="Number of checked all-reduces. The first includes cold compilation (default: 2).",
     )
+    parser.add_argument("--coordinator-address", help="JAX coordinator host:port for a multi-process probe.")
+    parser.add_argument("--coordinator-bind-address", help="Optional process-0 coordinator bind address.")
+    parser.add_argument("--num-processes", type=int, help="Total JAX process count.")
+    parser.add_argument("--process-id", type=int, help="This process's dense zero-based rank.")
+    parser.add_argument("--local-device-ids", help="Comma-separated physical GPU IDs assigned to this rank.")
+    parser.add_argument("--fsdp-devices", type=int, help="FSDP mesh width; defaults to all global devices.")
+    parser.add_argument("--initialization-timeout", type=int, default=300)
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    distributed_values = (args.coordinator_address, args.num_processes, args.process_id, args.local_device_ids)
+    if any(value is not None for value in distributed_values) and not all(
+        value is not None for value in distributed_values
+    ):
+        raise ValueError(
+            "Distributed probing requires coordinator-address, num-processes, process-id, and local-device-ids"
+        )
+    if args.visible_devices and args.local_device_ids:
+        raise ValueError("Use either --visible-devices or --local-device-ids, not both")
     if args.visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.visible_devices
     # This probe transfers only a few bytes and should not reserve training-sized GPU pools.
@@ -39,6 +55,18 @@ def main() -> None:
     import jax
 
     from openpi.training import gpu_collectives
+    from openpi.training import sharding
+
+    if all(value is not None for value in distributed_values):
+        local_device_ids = [int(value) for value in args.local_device_ids.split(",")]
+        jax.distributed.initialize(
+            coordinator_address=args.coordinator_address,
+            coordinator_bind_address=args.coordinator_bind_address,
+            num_processes=args.num_processes,
+            process_id=args.process_id,
+            local_device_ids=local_device_ids,
+            initialization_timeout=args.initialization_timeout,
+        )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     devices = tuple(jax.local_devices())
@@ -57,6 +85,21 @@ def main() -> None:
         result.expected_sum,
         ", ".join(f"{elapsed:.3f}s" for elapsed in result.elapsed_seconds),
     )
+    if jax.process_count() > 1:
+        fsdp_devices = args.fsdp_devices or jax.device_count()
+        mesh = sharding.make_mesh(fsdp_devices)
+        global_result = gpu_collectives.run_global_collective_probe(
+            mesh,
+            repetitions=args.repetitions,
+            require_multiple_processes=True,
+        )
+        logging.info(
+            "Global collective check passed: processes=%d, devices=%d, expected_sum=%.1f, timings=%s",
+            global_result.process_count,
+            global_result.global_device_count,
+            global_result.expected_sum,
+            ", ".join(f"{elapsed:.3f}s" for elapsed in global_result.elapsed_seconds),
+        )
 
 
 if __name__ == "__main__":

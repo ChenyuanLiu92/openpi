@@ -91,6 +91,7 @@ class DistributedConfig:
     warmup_collectives: bool
     initialize: bool
     coordinator_address: str | None
+    coordinator_bind_address: str | None
     num_processes: int | None
     process_id: int | None
     local_device_ids: tuple[int, ...] | None
@@ -237,6 +238,39 @@ class PretrainConfig:
             and self.distributed.process_id >= self.distributed.num_processes
         ):
             raise ValueError("distributed.process_id must be smaller than distributed.num_processes")
+        local_device_ids = self.distributed.local_device_ids
+        if local_device_ids is not None:
+            if not local_device_ids:
+                raise ValueError("distributed.local_device_ids must not be empty")
+            if any(device_id < 0 for device_id in local_device_ids):
+                raise ValueError("distributed.local_device_ids must be non-negative")
+            if len(local_device_ids) != len(set(local_device_ids)):
+                raise ValueError("distributed.local_device_ids must be unique")
+        explicit_values = (
+            self.distributed.coordinator_address,
+            self.distributed.num_processes,
+            self.distributed.process_id,
+            self.distributed.local_device_ids,
+        )
+        has_explicit_values = any(value is not None for value in explicit_values)
+        if not self.distributed.initialize and (
+            has_explicit_values
+            or self.distributed.coordinator_bind_address is not None
+            or self.distributed.cluster_detection_method is not None
+        ):
+            raise ValueError("distributed.initialize must be true when distributed initialization fields are set")
+        if self.distributed.initialize:
+            if self.distributed.cluster_detection_method is not None and has_explicit_values:
+                raise ValueError(
+                    "Use either distributed.cluster_detection_method or explicit coordinator/rank/device fields, not both"
+                )
+            if self.distributed.cluster_detection_method is None and not all(
+                value is not None for value in explicit_values
+            ):
+                raise ValueError(
+                    "Explicit distributed initialization requires coordinator_address, num_processes, process_id, "
+                    "and local_device_ids"
+                )
         if self.overwrite and self.resume:
             raise ValueError("overwrite and resume cannot both be true")
 

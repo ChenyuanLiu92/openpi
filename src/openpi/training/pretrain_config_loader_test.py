@@ -22,6 +22,7 @@ def test_complete_pi05_pretrain_template_is_valid():
     assert resolved.config.model.pi05 is True
     assert resolved.config.exp_name == "baseline"
     assert resolved.config.distributed.warmup_collectives is True
+    assert resolved.config.distributed.coordinator_bind_address is None
     assert resolved.config.data.effective_probabilities() == (1.0,)
     assert (
         resolved.config.checkpoint_dir == pathlib.Path("checkpoints/pretraining/pi05_rlds_pretrain/baseline").resolve()
@@ -50,6 +51,40 @@ def test_pretrain_config_supports_cli_overrides():
     assert resolved.config.data.temperature == 2.0
     assert resolved.config.distributed.warmup_collectives is False
     assert resolved.manifest["checkpoint"]["exp_name"] == "baseline"
+
+
+def test_pretrain_config_validates_explicit_distributed_topology():
+    config = pretrain_config_loader.load(_template_path()).config
+    incomplete = dataclasses.replace(config.distributed, initialize=True, coordinator_address="node0:12345")
+
+    with pytest.raises(ValueError, match="requires coordinator_address"):
+        dataclasses.replace(config, distributed=incomplete)
+
+    complete = dataclasses.replace(
+        config.distributed,
+        initialize=True,
+        coordinator_address="node0:12345",
+        coordinator_bind_address="[::]:12345",
+        num_processes=2,
+        process_id=0,
+        local_device_ids=(0, 1, 2, 3),
+    )
+    assert dataclasses.replace(config, distributed=complete).distributed.num_processes == 2
+
+
+def test_pretrain_config_rejects_duplicate_local_devices():
+    config = pretrain_config_loader.load(_template_path()).config
+    distributed = dataclasses.replace(
+        config.distributed,
+        initialize=True,
+        coordinator_address="node0:12345",
+        num_processes=2,
+        process_id=0,
+        local_device_ids=(0, 0),
+    )
+
+    with pytest.raises(ValueError, match="must be unique"):
+        dataclasses.replace(config, distributed=distributed)
 
 
 def test_pretrain_snapshot_is_safe_yaml(tmp_path: pathlib.Path):

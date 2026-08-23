@@ -11,6 +11,8 @@ import pathlib
 import time
 
 import jax
+from jax.experimental import multihost_utils
+from jax.experimental.shard_map import shard_map
 import jax.numpy as jnp
 import numpy as np
 
@@ -20,6 +22,16 @@ class CollectiveProbeResult:
     """Result of one or more numerically checked local all-reduces."""
 
     device_count: int
+    expected_sum: float
+    elapsed_seconds: tuple[float, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class GlobalCollectiveProbeResult:
+    """Numerically checked collectives spanning every device in a global mesh."""
+
+    process_count: int
+    global_device_count: int
     expected_sum: float
     elapsed_seconds: tuple[float, ...]
 
@@ -107,7 +119,10 @@ def run_local_fsdp_collective_probe(
 
     device_count = len(devices)
     expected_sum = float(sum(range(device_count)))
-    payload_rows = 1024
+    # Tiled reduce-scatter requires the scatter dimension to be divisible by the
+    # number of participating devices. Round up so the probe also works on
+    # non-power-of-two topologies such as 3 or 6 GPUs.
+    payload_rows = _round_up_to_multiple(1024, device_count)
     payload_columns = 256
 
     def _fsdp_collectives(rank):
@@ -166,6 +181,92 @@ def warmup_local_collectives(*, enabled: bool, devices: Sequence[jax.Device] | N
     run_local_fsdp_collective_probe(devices=devices)
 
 
+def run_global_collective_probe(
+    mesh: jax.sharding.Mesh,
+    *,
+    repetitions: int = 1,
+    require_multiple_processes: bool = False,
+) -> GlobalCollectiveProbeResult:
+    """Run collectives across all axes of a global mesh, including remote processes."""
+    if repetitions <= 0:
+        raise ValueError("repetitions must be positive")
+    if require_multiple_processes and jax.process_count() < 2:
+        raise RuntimeError("The global collective probe requires at least two JAX processes")
+
+    axis_names = tuple(mesh.axis_names)
+    device_count = int(mesh.size)
+    expected_sum = float(sum(range(device_count)))
+    payload_rows = _round_up_to_multiple(1024, device_count)
+    payload_columns = 256
+
+    def _global_collectives(_trigger):
+        linear_index = jnp.asarray(0, dtype=jnp.int32)
+        for axis_name in axis_names:
+            linear_index = linear_index * mesh.shape[axis_name] + jax.lax.axis_index(axis_name)
+        rank = linear_index.astype(jnp.float32)
+        payload = jnp.full((payload_rows, payload_columns), rank, dtype=jnp.float32)
+        return (
+            jax.lax.psum(rank, axis_names),
+            jax.lax.all_gather(payload, axis_names, axis=0, tiled=True),
+            jax.lax.psum_scatter(payload, axis_names, scatter_dimension=0, tiled=True),
+        )
+
+    mapped = shard_map(
+        _global_collectives,
+        mesh=mesh,
+        in_specs=jax.sharding.PartitionSpec(),
+        out_specs=(
+            jax.sharding.PartitionSpec(),
+            jax.sharding.PartitionSpec(),
+            jax.sharding.PartitionSpec(axis_names),
+        ),
+        # JAX 0.5.3 does not infer tuple-axis all_gather replication even though
+        # the result is numerically identical on every device; the checks below
+        # validate the full gathered and reduce-scattered payloads explicitly.
+        check_rep=False,
+    )
+    collective = jax.jit(mapped)
+    elapsed_seconds: list[float] = []
+    for repetition in range(repetitions):
+        start = time.monotonic()
+        all_reduce, all_gather, reduce_scatter = collective(jnp.asarray(0, dtype=jnp.int32))
+        jax.block_until_ready((all_reduce, all_gather, reduce_scatter))
+        elapsed = time.monotonic() - start
+        _validate_global_addressable_results(
+            all_reduce,
+            all_gather,
+            reduce_scatter,
+            expected_sum=expected_sum,
+            device_count=device_count,
+            payload_rows=payload_rows,
+            payload_columns=payload_columns,
+        )
+        elapsed_seconds.append(elapsed)
+        logging.info(
+            "Global collective probe %d/%d passed across %d processes and %d devices in %.3f seconds",
+            repetition + 1,
+            repetitions,
+            jax.process_count(),
+            device_count,
+            elapsed,
+        )
+
+    multihost_utils.sync_global_devices("global_collective_probe_complete")
+    return GlobalCollectiveProbeResult(
+        process_count=jax.process_count(),
+        global_device_count=device_count,
+        expected_sum=expected_sum,
+        elapsed_seconds=tuple(elapsed_seconds),
+    )
+
+
+def warmup_collectives(*, enabled: bool, mesh: jax.sharding.Mesh) -> None:
+    """Warm local collectives and, for multi-process jobs, the complete global mesh."""
+    warmup_local_collectives(enabled=enabled)
+    if enabled and jax.process_count() > 1:
+        run_global_collective_probe(mesh, require_multiple_processes=True)
+
+
 def _validate_collective_results(
     all_reduce: np.ndarray,
     all_gather: np.ndarray,
@@ -199,6 +300,80 @@ def _validate_collective_results(
             "ReduceScatter produced shape/value mismatch: "
             f"shape={reduce_scatter.shape}, expected={expected_reduce_scatter.shape}"
         )
+
+
+def _validate_global_collective_results(
+    all_reduce: np.ndarray,
+    all_gather: np.ndarray,
+    reduce_scatter: np.ndarray,
+    *,
+    expected_sum: float,
+    device_count: int,
+    payload_rows: int,
+    payload_columns: int,
+) -> None:
+    if all_reduce.shape != () or float(all_reduce) != expected_sum:
+        raise RuntimeError(f"Global AllReduce produced {all_reduce!r}; expected scalar {expected_sum}")
+
+    expected_gather_shape = (payload_rows * device_count, payload_columns)
+    if all_gather.shape != expected_gather_shape:
+        raise RuntimeError(f"Global AllGather produced shape {all_gather.shape}; expected {expected_gather_shape}")
+    unique, counts = np.unique(all_gather, return_counts=True)
+    expected_values = np.arange(device_count, dtype=np.float32)
+    expected_counts = np.full(device_count, payload_rows * payload_columns, dtype=np.int64)
+    if not np.array_equal(unique, expected_values) or not np.array_equal(counts, expected_counts):
+        raise RuntimeError("Global AllGather produced an unexpected set of device payloads")
+
+    expected_scatter_shape = (payload_rows, payload_columns)
+    if reduce_scatter.shape != expected_scatter_shape or not np.all(reduce_scatter == expected_sum):
+        raise RuntimeError(
+            "Global ReduceScatter produced shape/value mismatch: "
+            f"shape={reduce_scatter.shape}, expected={expected_scatter_shape} filled with {expected_sum}"
+        )
+
+
+def _validate_global_addressable_results(
+    all_reduce: jax.Array,
+    all_gather: jax.Array,
+    reduce_scatter: jax.Array,
+    *,
+    expected_sum: float,
+    device_count: int,
+    payload_rows: int,
+    payload_columns: int,
+) -> None:
+    """Validate process-local shards without fetching non-addressable global shards."""
+    all_reduce_shards = [np.asarray(jax.device_get(shard.data)) for shard in all_reduce.addressable_shards]
+    if not all(value.shape == () and float(value) == expected_sum for value in all_reduce_shards):
+        raise RuntimeError(f"Global AllReduce addressable shards are not scalar {expected_sum}: {all_reduce_shards}")
+
+    expected_gather_shape = (payload_rows * device_count, payload_columns)
+    expected_values = np.arange(device_count, dtype=np.float32)
+    expected_counts = np.full(device_count, payload_rows * payload_columns, dtype=np.int64)
+    for shard in all_gather.addressable_shards:
+        value = np.asarray(jax.device_get(shard.data))
+        unique, counts = np.unique(value, return_counts=True)
+        if (
+            value.shape != expected_gather_shape
+            or not np.array_equal(unique, expected_values)
+            or not np.array_equal(counts, expected_counts)
+        ):
+            raise RuntimeError("Global AllGather produced an invalid addressable replicated shard")
+
+    expected_local_shape = (payload_rows // device_count, payload_columns)
+    for shard in reduce_scatter.addressable_shards:
+        value = np.asarray(jax.device_get(shard.data))
+        if value.shape != expected_local_shape or not np.all(value == expected_sum):
+            raise RuntimeError(
+                "Global ReduceScatter produced an invalid addressable shard: "
+                f"shape={value.shape}, expected={expected_local_shape} filled with {expected_sum}"
+            )
+
+
+def _round_up_to_multiple(value: int, divisor: int) -> int:
+    if value <= 0 or divisor <= 0:
+        raise ValueError("value and divisor must be positive")
+    return ((value + divisor - 1) // divisor) * divisor
 
 
 def _path_is_writable(path: pathlib.Path) -> bool:

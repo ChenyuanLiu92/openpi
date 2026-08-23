@@ -53,6 +53,7 @@ def _initialize_distributed(config: pretrain_config.DistributedConfig) -> None:
         return
     jax.distributed.initialize(
         coordinator_address=config.coordinator_address,
+        coordinator_bind_address=config.coordinator_bind_address,
         num_processes=config.num_processes,
         process_id=config.process_id,
         local_device_ids=None if config.local_device_ids is None else list(config.local_device_ids),
@@ -167,7 +168,7 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
     rng = jax.random.key(config.seed)
     train_rng, init_rng, validation_rng = jax.random.split(rng, 3)
     mesh = sharding.make_mesh(config.fsdp_devices)
-    gpu_collectives.warmup_local_collectives(enabled=config.distributed.warmup_collectives)
+    gpu_collectives.warmup_collectives(enabled=config.distributed.warmup_collectives, mesh=mesh)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
