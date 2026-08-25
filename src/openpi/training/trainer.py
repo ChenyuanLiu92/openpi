@@ -108,15 +108,27 @@ def pretrain_step(
     model.train()
 
     def loss_fn(model: _model.BaseModel, key: at.KeyArrayLike):
-        loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
-        valid_count = jnp.asarray(0.0, dtype=jnp.float32)
-        valid_actions = jnp.asarray(0.0, dtype=jnp.float32)
-        action_elements = jnp.asarray(0.0, dtype=jnp.float32)
-        source_loss_sums = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
-        source_valid_counts = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
-        source_examples = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
-        for micro_index in range(config.gradient_accumulation_steps):
-            micro = jax.tree.map(lambda value, index=micro_index: value[index], batch)
+        initial = (
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.zeros(len(config.data.sources), dtype=jnp.float32),
+            jnp.zeros(len(config.data.sources), dtype=jnp.float32),
+            jnp.zeros(len(config.data.sources), dtype=jnp.float32),
+        )
+
+        def accumulate(carry, inputs):
+            (
+                loss_sum,
+                valid_count,
+                valid_actions,
+                action_elements,
+                source_loss_sums,
+                source_valid_counts,
+                source_examples,
+            ) = carry
+            micro_index, micro = inputs
             chunked_loss = model.compute_loss(
                 jax.random.fold_in(key, micro_index),
                 micro.observation,
@@ -126,16 +138,41 @@ def pretrain_step(
             )
             time_mask = jnp.any(micro.action_mask, axis=-1)
             numeric_mask = time_mask.astype(jnp.float32)
-            loss_sum += jnp.sum(chunked_loss * numeric_mask)
-            valid_count += jnp.sum(numeric_mask)
-            valid_actions += jnp.sum(micro.action_mask)
-            action_elements += micro.action_mask.size
+            loss_sum = loss_sum + jnp.sum(chunked_loss * numeric_mask)
+            valid_count = valid_count + jnp.sum(numeric_mask)
+            valid_actions = valid_actions + jnp.sum(micro.action_mask)
+            action_elements = action_elements + micro.action_mask.size
             for source_index in range(len(config.data.sources)):
                 example_mask = micro.source_id == source_index
                 source_mask = numeric_mask * example_mask[:, None]
                 source_loss_sums = source_loss_sums.at[source_index].add(jnp.sum(chunked_loss * source_mask))
                 source_valid_counts = source_valid_counts.at[source_index].add(jnp.sum(source_mask))
                 source_examples = source_examples.at[source_index].add(jnp.sum(example_mask))
+            return (
+                loss_sum,
+                valid_count,
+                valid_actions,
+                action_elements,
+                source_loss_sums,
+                source_valid_counts,
+                source_examples,
+            ), None
+
+        with jax.named_scope("microbatch_gradient_accumulation"):
+            accumulated, _ = jax.lax.scan(
+                accumulate,
+                initial,
+                (jnp.arange(config.gradient_accumulation_steps, dtype=jnp.uint32), batch),
+            )
+        (
+            loss_sum,
+            valid_count,
+            valid_actions,
+            action_elements,
+            source_loss_sums,
+            source_valid_counts,
+            source_examples,
+        ) = accumulated
         loss = loss_sum / jnp.clip(valid_count, 1)
         aux = (valid_actions / jnp.clip(action_elements, 1), source_loss_sums, source_valid_counts, source_examples)
         return loss, aux
@@ -143,7 +180,8 @@ def pretrain_step(
     train_rng = jax.random.fold_in(rng, state.step)
     diff_state = nnx.DiffState(0, config.trainable_filter)
     (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, train_rng)
-    new_state, model = _apply_gradients(config, state, model, grads)
+    with jax.named_scope("optimizer_update_after_accumulation"):
+        new_state, model = _apply_gradients(config, state, model, grads)
     metrics = _base_metrics(model, loss, grads)
     valid_action_fraction, source_loss_sums, source_valid_counts, source_examples = aux
     metrics["valid_action_fraction"] = valid_action_fraction
@@ -164,13 +202,17 @@ def validation_step(
     """No-gradient, augmentation-free validation on current parameters."""
     model = nnx.merge(state.model_def, state.params)
     model.eval()
-    loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
-    valid_count = jnp.asarray(0.0, dtype=jnp.float32)
-    source_loss_sums = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
-    source_valid_counts = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
-    source_examples = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
-    for micro_index in range(config.gradient_accumulation_steps):
-        micro = jax.tree.map(lambda value, index=micro_index: value[index], batch)
+    initial = (
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.zeros(len(config.data.sources), dtype=jnp.float32),
+        jnp.zeros(len(config.data.sources), dtype=jnp.float32),
+        jnp.zeros(len(config.data.sources), dtype=jnp.float32),
+    )
+
+    def accumulate(carry, inputs):
+        loss_sum, valid_count, source_loss_sums, source_valid_counts, source_examples = carry
+        micro_index, micro = inputs
         chunked_loss = model.compute_loss(
             jax.random.fold_in(rng, micro_index),
             micro.observation,
@@ -180,14 +222,23 @@ def validation_step(
         )
         time_mask = jnp.any(micro.action_mask, axis=-1)
         numeric_mask = time_mask.astype(jnp.float32)
-        loss_sum += jnp.sum(chunked_loss * numeric_mask)
-        valid_count += jnp.sum(numeric_mask)
+        loss_sum = loss_sum + jnp.sum(chunked_loss * numeric_mask)
+        valid_count = valid_count + jnp.sum(numeric_mask)
         for source_index in range(len(config.data.sources)):
             example_mask = micro.source_id == source_index
             source_mask = numeric_mask * example_mask[:, None]
             source_loss_sums = source_loss_sums.at[source_index].add(jnp.sum(chunked_loss * source_mask))
             source_valid_counts = source_valid_counts.at[source_index].add(jnp.sum(source_mask))
             source_examples = source_examples.at[source_index].add(jnp.sum(example_mask))
+        return (loss_sum, valid_count, source_loss_sums, source_valid_counts, source_examples), None
+
+    with jax.named_scope("validation_microbatch_scan"):
+        accumulated, _ = jax.lax.scan(
+            accumulate,
+            initial,
+            (jnp.arange(config.gradient_accumulation_steps, dtype=jnp.uint32), batch),
+        )
+    loss_sum, valid_count, source_loss_sums, source_valid_counts, source_examples = accumulated
     metrics = {"loss": loss_sum / jnp.clip(valid_count, 1)}
     total_examples = jnp.sum(source_examples)
     for index, source in enumerate(config.data.sources):

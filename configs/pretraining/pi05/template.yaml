@@ -18,8 +18,8 @@
 #      uv run --group rlds scripts/pretrain.py configs/pretraining/pi05/<实验>.yaml \
 #        --exp-name lr_ablation --optimizer.clip-gradient-norm 0.5
 
-# schema 版本；v2 增加输入流水线、梯度累积、动态混合、精确恢复和通信诊断。
-schema_version: 2
+# schema 版本；v3 增加真实 iterator checkpoint、I/O 重试、通信基线和集群生命周期配置。
+schema_version: 3
 
 # 配置种类；预训练入口只接受 pi05_pretrain。
 kind: pi05_pretrain
@@ -112,6 +112,16 @@ data:
     max_bad_fraction: 0.01
     # quarantine 策略的 JSONL 目录；记录 source、异常和 prompt 哈希，不写原始图像/文本。
     quarantine_dir: null
+    # 混合 iterator 的 TFDS 读取失败最大重试次数；耗尽后安全终止训练（此阶段无法可靠归因 source）。
+    # 已携带 source_id 的 adapter/tokenize 坏样本才按 source_failure_policy 做 source 级降级。
+    source_max_retries: 3
+    # I/O 重试的指数退避初始和最大等待秒数。
+    source_retry_initial_seconds: 1.0
+    source_retry_max_seconds: 30.0
+    # 每隔多少个消费 batch 做一次可能阻塞的 host→device 完成时间采样。
+    metrics_sample_interval_steps: 100
+    # loader.close() 等待 host prefetch worker 退出的最长秒数。
+    worker_shutdown_timeout_seconds: 10.0
 
   # 动态数据混合策略。静态实验可保留空 schedule。
   mixing:
@@ -272,7 +282,7 @@ checkpoint:
   # true 会清空同名 checkpoint 目录。不要和 resume 同时打开。
   overwrite: false
 
-  # true 从最新 checkpoint 精确恢复 model/optimizer/EMA/step；数据流按记录计数做统计恢复。
+  # true 从最新 checkpoint 恢复 model/optimizer/EMA/step；数据流恢复语义由 data_resume_mode 决定。
   resume: false
 
   # statistical 只恢复采样统计；exact 在相同进程/device 拓扑下恢复确定性 mixer/iterator 位置。
@@ -280,6 +290,12 @@ checkpoint:
 
   # exact checkpoint 遇到不同拓扑时：error 拒绝启动；statistical 明确降级为统计恢复。
   on_topology_change: statistical
+
+  # exact 恢复时缺少某个 rank 的 iterator sidecar：error 拒绝恢复；statistical 显式降级。
+  on_missing_iterator_state: error
+
+  # 保存每个 rank 的 tf.data iterator snapshot 的最长允许时间（秒）。
+  iterator_snapshot_timeout_seconds: 120.0
 
 # 日志的全部字段。
 logging:
@@ -388,6 +404,22 @@ distributed:
     profile_start_step: null
     # trace 覆盖的 optimizer step 数，用于分析真实通信/计算 overlap。
     profile_num_steps: 5
+    # 已验收机器的 collective JSON 基线；null 表示不做启动性能门禁。
+    collective_baseline_path: null
+    # 当前 algorithm bandwidth 低于基线这一比例时触发告警或失败。
+    minimum_baseline_fraction: 0.8
+    # warn 只记录告警；fail 在训练初始化前拒绝启动。
+    bandwidth_regression_policy: warn
+
+# 外部调度器生命周期策略。local 由 launch_pretrain.py 管理；slurm 使用 submit_pretrain_slurm.py。
+cluster:
+  platform: local
+  # Slurm job 因节点故障/抢占退出时，最多自动 requeue 的次数。
+  max_restarts: 3
+  # Slurm 在强制结束前提前多少秒发送 USR1，让训练保存 checkpoint。
+  preemption_grace_seconds: 120
+  # 重排队后允许节点/GPU 数变化；exact 数据恢复会按 on_topology_change 决定是否降级。
+  allow_topology_change: true
 
 # validation 的全部字段。
 validation:

@@ -55,6 +55,11 @@ class PipelineConfig:
     max_bad_samples: int
     max_bad_fraction: float
     quarantine_dir: str | None
+    source_max_retries: int
+    source_retry_initial_seconds: float
+    source_retry_max_seconds: float
+    metrics_sample_interval_steps: int
+    worker_shutdown_timeout_seconds: float
 
 
 @dataclasses.dataclass(frozen=True)
@@ -216,6 +221,19 @@ class DistributedDiagnosticsConfig:
     straggler_ratio_threshold: float
     profile_start_step: int | None
     profile_num_steps: int
+    collective_baseline_path: str | None
+    minimum_baseline_fraction: float
+    bandwidth_regression_policy: Literal["warn", "fail"]
+
+
+@dataclasses.dataclass(frozen=True)
+class ClusterConfig:
+    """External scheduler lifecycle policy; the local launcher ignores it."""
+
+    platform: Literal["local", "slurm"]
+    max_restarts: int
+    preemption_grace_seconds: int
+    allow_topology_change: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,6 +273,8 @@ class PretrainConfig:
     gradient_accumulation_steps: int
     data_resume_mode: Literal["statistical", "exact"]
     on_topology_change: Literal["error", "statistical"]
+    on_missing_iterator_state: Literal["error", "statistical"]
+    iterator_snapshot_timeout_seconds: float
     num_train_steps: int
     assets_base_dir: str
     checkpoint_base_dir: str
@@ -278,6 +298,7 @@ class PretrainConfig:
     validation: ValidationConfig
     distributed: DistributedConfig
     runtime: RuntimeConfig
+    cluster: ClusterConfig
     policy_metadata: dict[str, Any] | None = None
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
@@ -337,6 +358,12 @@ class PretrainConfig:
             raise ValueError("pipeline.max_bad_fraction must be in [0, 1]")
         if pipeline.bad_sample_policy == "quarantine" and not pipeline.quarantine_dir:
             raise ValueError("pipeline.quarantine_dir is required when bad_sample_policy is quarantine")
+        if pipeline.source_max_retries < 0:
+            raise ValueError("pipeline.source_max_retries must be non-negative")
+        if not 0 <= pipeline.source_retry_initial_seconds <= pipeline.source_retry_max_seconds:
+            raise ValueError("pipeline source retry delays must satisfy 0 <= initial <= maximum")
+        if pipeline.metrics_sample_interval_steps <= 0 or pipeline.worker_shutdown_timeout_seconds <= 0:
+            raise ValueError("pipeline metric interval and worker shutdown timeout must be positive")
         schedule_steps = [point.step for point in self.data.mixing.schedule]
         if schedule_steps != sorted(set(schedule_steps)) or any(step < 0 for step in schedule_steps):
             raise ValueError("mixing schedule steps must be unique, non-negative, and increasing")
@@ -528,6 +555,12 @@ class PretrainConfig:
                 )
         if self.overwrite and self.resume:
             raise ValueError("overwrite and resume cannot both be true")
+        if self.iterator_snapshot_timeout_seconds <= 0:
+            raise ValueError("iterator_snapshot_timeout_seconds must be positive")
+        if not 0 < diagnostics.minimum_baseline_fraction <= 1:
+            raise ValueError("diagnostics.minimum_baseline_fraction must be in (0, 1]")
+        if self.cluster.max_restarts < 0 or self.cluster.preemption_grace_seconds <= 0:
+            raise ValueError("cluster max_restarts must be non-negative and grace period positive")
 
     @property
     def weight_loader(self) -> weight_loaders.WeightLoader:

@@ -119,8 +119,15 @@ uv run --group rlds scripts/pretrain.py <config.yaml>
 
 验证按 source 独立读取 `validation_split`，记录每个 source 的 loss、source macro loss 和按训练概率加权的 mixture loss。
 checkpoint 精确保存和恢复模型参数、optimizer、EMA 与 step，同时保存完整 YAML manifest、CLI override、Git revision、
-所有 normalization assets 和各 source 已消费样本数。RLDS shuffle/prefetch 流采用统计恢复：resume 后使用由 step 派生的新 seed，
-不会逐条重放中断前的数据顺序。
+所有 normalization assets 和各 source 已消费样本数。`data_resume_mode: exact` 会在同一个 Orbax step 中为每个 rank 保存
+tf.data iterator 与 source 健康状态，恢复时直接回到下一个 batch，不再按 step 回放；它要求相同 topology，并会关闭无法原子保存的
+Python/device 预取。sidecar 缺失或 topology 改变时，由 `on_missing_iterator_state`/`on_topology_change` 决定拒绝恢复还是显式降级到
+`statistical`。统计恢复会使用 step 派生的新 seed，不保证逐条复现数据顺序。
+
+输入侧按 rank 记录 TFDS fetch、tokenize、host queue wait、device submit、抽样 host-to-device block、queue depth、坏 batch、
+重试以及每个 source 的实际比例、饥饿 step、quota shortfall 和重复率。混合 iterator 的底层 TFDS 读取错误会指数退避重试；由于
+错误发生在 sample 产出 source ID 之前，重试耗尽后会 fail-safe 终止，而不会错误地降级无关 source。已进入 adapter/tokenize
+阶段的异常携带 source ID，可按 `source_failure_policy: degrade` 独立计数和降级，并且未完成 `min_samples` 的 source 不允许降级。
 
 ## 全周期日志、W&B 与告警
 
@@ -191,8 +198,20 @@ uv run --group rlds scripts/launch_pretrain.py local <config.yaml> \
   --batch-size 8 --num-train-steps 2
 ```
 
-真实多机不由本脚本执行 SSH。Slurm、Kubernetes 或人工 SSH 在每个节点分别运行 `rank`，所有节点使用完全相同的 YAML
-和共享 checkpoint 路径，只改变运行时 rank：
+真实多机不由本脚本执行 SSH。Slurm 可由仓库内置提交器启动一节点一 JAX process；YAML 设置 `cluster.platform: slurm`，
+checkpoint 必须位于所有节点可见的共享文件系统：
+
+```bash
+uv run --group rlds scripts/submit_pretrain_slurm.py <config.yaml> \
+  --nodes 4 --gpus-per-node 8 --cpus-per-task 64 --partition gpu
+```
+
+提交器配置 `USR1` 提前通知、checkpoint grace period 和 whole-job requeue；任一 rank 失败时 `srun --kill-on-bad-exit`
+终止整个 step，重排队次数受 `cluster.max_restarts` 限制。重排队后训练从最新 checkpoint 恢复；节点身份可以改变，设备总数改变时
+exact 数据恢复按 `cluster.allow_topology_change` 与 `checkpoint.on_topology_change` 的策略处理。先加 `--dry-run` 可检查完整 `sbatch`
+命令而不提交任务。
+
+Kubernetes 或人工 SSH 仍可在每个节点分别运行 `rank`，所有节点使用完全相同的 YAML 和共享 checkpoint 路径，只改变运行时 rank：
 
 ```bash
 # node 0
@@ -230,6 +249,11 @@ distributed:
 多网卡真实节点可通过 `coordinator_bind_address` 控制 process 0 的监听接口，并按集群实际网络设置
 `NCCL_SOCKET_IFNAME`、`NCCL_IB_HCA`。本机双 rank 测试只能验证 JAX 多进程、跨 rank NCCL 和训练语义，不能替代真实
 IB/RoCE 链路验收。
+
+`check_gpu_collectives.py --write-baseline <file.json>` 可在健康集群上记录各 payload 的 AllReduce/AllGather/ReduceScatter
+带宽；后续用 `--baseline` 检查，或在 YAML 配置 `distributed.diagnostics.collective_baseline_path` 作为训练启动门禁。拓扑日志同时记录
+GPU 拓扑、网卡状态/MTU/link speed/NUMA、RDMA device 和关键 NCCL 绑定。真实训练阶段的 JAX profiler trace 由
+`profile_start_step/profile_num_steps` 控制，可用于在 TensorBoard/XProf 中区分计算、collective 与 overlap。
 
 仓库提供可重复的完整模型 smoke test。它会在一个全新的 PFS 目录生成两个 mock RLDS source，依次执行跨 rank 通信探针、
 完整 `gemma_2b + gemma_300m` step 1 保存和 resume 到 step 2，并核对数据消费计数、有限 loss/grad 和 rank 日志：
