@@ -3,6 +3,7 @@ import os
 import pathlib
 
 import pytest
+import yaml
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
@@ -24,6 +25,12 @@ def test_train(tmp_path: pathlib.Path, config_name: str):
         log_interval=1,
     )
     train.main(config)
+
+    metadata_path = tmp_path / "checkpoint" / config_name / "test" / "1" / "metadata" / "train_config.yaml"
+    assert metadata_path.is_file()
+    metadata = yaml.safe_load(metadata_path.read_text())
+    assert metadata["name"] == config_name
+    assert metadata["resolved_config"]["num_train_steps"] == 2
 
     # test resuming
     config = dataclasses.replace(config, resume=True, num_train_steps=4)

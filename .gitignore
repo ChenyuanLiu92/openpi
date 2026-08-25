@@ -1,7 +1,10 @@
 # Data directories.
 assets/
 checkpoints/
-data/
+/data/
+/dataset
+/datasets/
+.runtime/
 wandb/
 
 # Byte-compiled / optimized / DLL files
@@ -55,6 +58,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+/pytest-of-root/
 cover/
 
 # Translations

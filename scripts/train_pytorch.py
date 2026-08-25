@@ -26,6 +26,7 @@ Multi-Node Training:
 import dataclasses
 import gc
 import logging
+import math
 import os
 import platform
 import shutil
@@ -44,7 +45,9 @@ import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
+import openpi.training.config_loader as _config_loader
 import openpi.training.data_loader as _data
+import openpi.training.optimizer as _optimizer
 
 
 def init_logging():
@@ -128,6 +131,109 @@ def build_datasets(config: _config.TrainConfig):
     return data_loader, data_loader.data_config()
 
 
+def _validate_pytorch_config(config: _config.TrainConfig) -> None:
+    for name in ("batch_size", "num_train_steps", "log_interval", "save_interval"):
+        if getattr(config, name) <= 0:
+            raise ValueError(f"{name} must be positive")
+
+    schedule = config.lr_schedule
+    for component_name, component in (("lr_schedule", schedule), ("optimizer", config.optimizer)):
+        for field in dataclasses.fields(component):
+            value = getattr(component, field.name)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{component_name}.{field.name} must be finite")
+
+    if isinstance(schedule, _optimizer.CosineDecaySchedule):
+        if (
+            schedule.warmup_steps < 0
+            or schedule.decay_steps <= schedule.warmup_steps
+            or schedule.peak_lr <= 0
+            or schedule.decay_lr < 0
+        ):
+            raise ValueError("Invalid cosine learning-rate schedule")
+    elif isinstance(schedule, _optimizer.RsqrtDecaySchedule):
+        if schedule.warmup_steps < 0 or schedule.peak_lr <= 0 or schedule.timescale <= 0:
+            raise ValueError("Invalid reciprocal-square-root learning-rate schedule")
+    else:
+        raise TypeError(f"Unsupported PyTorch learning-rate schedule: {type(schedule).__name__}")
+
+    optimizer = config.optimizer
+    if isinstance(optimizer, _optimizer.AdamW):
+        if (
+            not 0 <= optimizer.b1 < 1
+            or not 0 <= optimizer.b2 < 1
+            or optimizer.eps <= 0
+            or optimizer.weight_decay < 0
+            or optimizer.clip_gradient_norm <= 0
+        ):
+            raise ValueError("Invalid AdamW optimizer parameters")
+    elif isinstance(optimizer, _optimizer.SGD):
+        if optimizer.lr <= 0 or not 0 <= optimizer.momentum < 1:
+            raise ValueError("Invalid SGD optimizer parameters")
+        if optimizer.nesterov and optimizer.momentum <= 0:
+            raise ValueError("SGD nesterov requires positive momentum")
+    else:
+        raise TypeError(f"Unsupported PyTorch optimizer: {type(optimizer).__name__}")
+
+
+def _create_lr_schedule(schedule: _optimizer.LRScheduleConfig):
+    if isinstance(schedule, _optimizer.CosineDecaySchedule):
+        init_lr = schedule.peak_lr / (schedule.warmup_steps + 1)
+
+        def cosine_schedule(step: int) -> float:
+            if step < schedule.warmup_steps:
+                return init_lr + (schedule.peak_lr - init_lr) * step / schedule.warmup_steps
+            progress = min(
+                1.0,
+                (step - schedule.warmup_steps) / max(1, schedule.decay_steps - schedule.warmup_steps),
+            )
+            cosine_decay = 0.5 * (1 + np.cos(np.pi * progress))
+            return float(schedule.decay_lr + (schedule.peak_lr - schedule.decay_lr) * cosine_decay)
+
+        return cosine_schedule
+
+    if isinstance(schedule, _optimizer.RsqrtDecaySchedule):
+        init_lr = schedule.peak_lr / (schedule.warmup_steps + 1)
+
+        def rsqrt_schedule(step: int) -> float:
+            if step < schedule.warmup_steps:
+                return init_lr + (schedule.peak_lr - init_lr) * step / schedule.warmup_steps
+            decay_step = step - schedule.warmup_steps
+            return float(schedule.peak_lr / np.sqrt((schedule.timescale + decay_step) / schedule.timescale))
+
+        return rsqrt_schedule
+
+    raise TypeError(f"Unsupported PyTorch learning-rate schedule: {type(schedule).__name__}")
+
+
+def _create_optimizer(model: torch.nn.Module, config: _optimizer.OptimizerConfig, initial_lr: float):
+    if isinstance(config, _optimizer.AdamW):
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=initial_lr,
+            betas=(config.b1, config.b2),
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+        )
+    if isinstance(config, _optimizer.SGD):
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=initial_lr,
+            momentum=config.momentum,
+            nesterov=config.nesterov,
+        )
+    raise TypeError(f"Unsupported PyTorch optimizer: {type(config).__name__}")
+
+
+def _gradient_norm(model: torch.nn.Module, config: _optimizer.OptimizerConfig):
+    max_norm = config.clip_gradient_norm if isinstance(config, _optimizer.AdamW) else float("inf")
+    return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+
+
+def _should_save_checkpoint(global_step: int, *, save_interval: int, num_train_steps: int) -> bool:
+    return global_step > 0 and (global_step % save_interval == 0 or global_step == num_train_steps)
+
+
 def get_model_state_dict(model):
     """Get state dict from model, handling DDP wrapper."""
     return (
@@ -146,13 +252,17 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, config_snapshot):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
 
     # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+    if _should_save_checkpoint(
+        global_step,
+        save_interval=config.save_interval,
+        num_train_steps=config.num_train_steps,
+    ):
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -176,6 +286,8 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             "timestamp": time.time(),
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+
+        _config_loader.write_snapshot(tmp_ckpt_dir / "metadata" / "train_config.yaml", config_snapshot)
 
         # save norm stats
         norm_stats = data_config.norm_stats
@@ -306,10 +418,12 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
-def train_loop(config: _config.TrainConfig):
+def train_loop(config: _config.TrainConfig, *, config_snapshot: dict | None = None):
+    _validate_pytorch_config(config)
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
+    config_snapshot = config_snapshot or _config_loader.snapshot_for_config(config)
 
     # Initialize checkpoint directory and wandb
     resuming = False
@@ -448,36 +562,14 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
-    # Optimizer + learning rate schedule from config
-    warmup_steps = config.lr_schedule.warmup_steps
-    peak_lr = config.lr_schedule.peak_lr
-    decay_steps = config.lr_schedule.decay_steps
-    end_lr = config.lr_schedule.decay_lr
-
-    # Create optimizer with config parameters
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=peak_lr,
-        betas=(config.optimizer.b1, config.optimizer.b2),
-        eps=config.optimizer.eps,
-        weight_decay=config.optimizer.weight_decay,
-    )
+    lr_schedule = _create_lr_schedule(config.lr_schedule)
+    optim = _create_optimizer(model, config.optimizer, lr_schedule(0))
 
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
         global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
         logging.info(f"Resumed training from step {global_step}")
-
-    def lr_schedule(step: int):
-        if step < warmup_steps:
-            # Match JAX behavior: start from peak_lr / (warmup_steps + 1)
-            init_lr = peak_lr / (warmup_steps + 1)
-            return init_lr + (peak_lr - init_lr) * step / warmup_steps
-        # cosine decay
-        progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
-        cos = 0.5 * (1 + np.cos(np.pi * progress))
-        return end_lr + (peak_lr - end_lr) * cos
 
     model.train()
     start_time = time.time()
@@ -490,12 +582,8 @@ def train_loop(config: _config.TrainConfig):
             f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
-        logging.info(
-            f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}"
-        )
-        logging.info(
-            f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
-        )
+        logging.info("LR schedule: %s", config.lr_schedule)
+        logging.info("Optimizer: %s", config.optimizer)
         logging.info("EMA is not supported for PyTorch training")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
@@ -506,11 +594,10 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
-    while global_step < config.num_train_steps:
-        # Set epoch for distributed training
-        if use_ddp and hasattr(loader, "set_epoch"):
-            loader.set_epoch(global_step // len(loader))
+    if use_ddp:
+        loader.set_epoch(global_step // len(loader))
 
+    while global_step < config.num_train_steps:
         for observation, actions in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
@@ -542,8 +629,9 @@ def train_loop(config: _config.TrainConfig):
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            # AdamW uses the configured clipping threshold. SGD records the same
+            # norm without clipping, matching the JAX optimizer definition.
+            grad_norm = _gradient_norm(model, config.optimizer)
 
             # Optimizer step
             optim.step()
@@ -602,7 +690,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, config_snapshot)
 
             # Update progress bar
             if pbar is not None:
@@ -624,8 +712,8 @@ def train_loop(config: _config.TrainConfig):
 
 def main():
     init_logging()
-    config = _config.cli()
-    train_loop(config)
+    resolved_config = _config.cli_with_metadata()
+    train_loop(resolved_config.config, config_snapshot=resolved_config.snapshot())
 
 
 if __name__ == "__main__":

@@ -21,6 +21,13 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
+def _norm_stats_output_path(train_config: _config.TrainConfig, data_config: _config.DataConfig):
+    asset_id = data_config.asset_id or data_config.repo_id
+    if asset_id is None:
+        raise ValueError("Data config must have an asset_id or repo_id")
+    return train_config.assets_dirs / asset_id
+
+
 def create_torch_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -86,17 +93,28 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
-    config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+def main(config: str | None = None, max_frames: int | None = None, config_name: str | None = None):
+    """Compute stats for a YAML config path or a built-in config name.
+
+    ``config_name`` is retained for compatibility with the original CLI.
+    """
+    if (config is None) == (config_name is None):
+        raise ValueError("Provide exactly one of --config or --config-name")
+    train_config = _config.get_config(config or config_name)  # type: ignore[arg-type]
+    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, max_frames
+            data_config, train_config.model.action_horizon, train_config.batch_size, max_frames
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config,
+            train_config.model.action_horizon,
+            train_config.batch_size,
+            train_config.model,
+            train_config.num_workers,
+            max_frames,
         )
 
     keys = ["state", "actions"]
@@ -108,7 +126,7 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = _norm_stats_output_path(train_config, data_config)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

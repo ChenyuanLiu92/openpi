@@ -1,0 +1,11 @@
+schema_version: 1
+name: pi05_libero_example
+base: pi05_libero
+
+overrides:
+  data:
+    repo_id: physical-intelligence/libero
+  model:
+    action_horizon: 10
+  batch_size: 256
+  num_train_steps: 30000

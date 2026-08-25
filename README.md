@@ -21,7 +21,7 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 
 ## Requirements
 
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
+To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the fine-tuning script does not yet support multi-node training. The dedicated [π0.5 pretraining pipeline](docs/pretraining.md) supports native JAX multi-host execution.
 
 | Mode               | Memory Required | Example GPU        |
 | ------------------ | --------------- | ------------------ |
@@ -159,6 +159,49 @@ Now we can kick off training with the following command (the `--overwrite` flag 
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
 ```
+
+#### Versioning experiments as YAML
+
+For a new experiment that uses an existing model and robot transform, you do not need to edit
+`src/openpi/training/config.py`. Add a standalone YAML file under `configs/experiments/`. Component `type` fields
+select safe, registered Python implementations without inheriting an experiment from `_CONFIGS`. See
+[`pi05_template.yaml`](configs/experiments/pi05_template.yaml) for a fully annotated π0.5 template containing every
+declarative training field:
+
+```yaml
+schema_version: 1
+name: pi05_my_libero
+model:
+  type: pi0
+  pi05: true
+  # ...all remaining model fields...
+data:
+  type: lerobot_libero
+  repo_id: my-org/my-libero
+  # ...all remaining data fields...
+training:
+  batch_size: 64
+  num_train_steps: 30000
+# ...checkpoint, optimizer, logging, paths, and other sections...
+```
+
+Then use the YAML path anywhere a training config is accepted:
+
+```bash
+uv run scripts/compute_norm_stats.py --config configs/experiments/pi05_my_libero.yaml
+uv run scripts/train.py configs/experiments/pi05_my_libero.yaml
+```
+
+Command-line flags still override YAML values. The older `base + overrides` YAML format remains supported for
+compatibility, but standalone configs are recommended for complete reproducibility. Each checkpoint records the source
+manifest, effective command-line overrides, resolved config, and Git revision in `metadata/train_config.yaml`.
+
+Python changes are still required when adding a new model implementation, data config factory, or robot transform.
+
+For multi-source robot-data pretraining rather than fine-tuning, use the separate
+[π0.5 RLDS pretraining pipeline](docs/pretraining.md). It provides standalone strict YAML configs, temperature-adjusted
+sample-level mixtures, source adapters, padded-action masks, per-source validation, statistical data-stream resume, and
+native JAX multi-host execution.
 
 The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
 

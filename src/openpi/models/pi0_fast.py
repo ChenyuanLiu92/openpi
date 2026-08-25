@@ -196,8 +196,16 @@ class Pi0FAST(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        action_mask: at.Bool[at.Array, "*b ah ad"] | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
+        if action_mask is not None:
+            raise ValueError("action_mask is only supported by pi0/pi0.5 flow-matching models")
         observation = _model.preprocess_observation(
             rng, observation, train=train, image_keys=list(observation.images.keys())
         )

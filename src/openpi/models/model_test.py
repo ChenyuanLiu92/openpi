@@ -1,8 +1,11 @@
 from flax import nnx
 import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from openpi.models import model as _model
+from openpi.models import pi0
 from openpi.models import pi0_config
 from openpi.models import pi0_fast
 from openpi.shared import download
@@ -22,6 +25,18 @@ def test_pi0_model():
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_pi05_action_mask_excludes_padded_dimensions():
+    squared_error = jnp.asarray([[[1.0, 4.0, 16.0, 64.0], [2.0, 8.0, 32.0, 128.0]]])
+    mask = jnp.asarray([[[True, True, False, False], [False, False, False, False]]])
+    changed_padding = squared_error.at[..., 2:].set(1e12)
+
+    loss = pi0._masked_action_loss(squared_error, mask)  # noqa: SLF001
+    changed_loss = pi0._masked_action_loss(changed_padding, mask)  # noqa: SLF001
+
+    np.testing.assert_allclose(loss, changed_loss)
+    np.testing.assert_allclose(loss, [[2.5, 0.0]])
 
 
 def test_pi0_lora_model():

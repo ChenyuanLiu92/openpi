@@ -975,12 +975,36 @@ if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
+def builtin_configs() -> dict[str, TrainConfig]:
+    """Return the built-in Python config presets."""
+    return _CONFIGS_DICT
+
+
 def cli() -> TrainConfig:
-    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
+    """Parse either a built-in config name or a YAML experiment config path."""
+    from openpi.training import config_loader
+
+    return config_loader.parse_cli().config
+
+
+def cli_with_metadata():
+    """Parse a config and retain its reproducibility metadata."""
+    from openpi.training import config_loader
+
+    return config_loader.parse_cli()
 
 
 def get_config(config_name: str) -> TrainConfig:
-    """Get a config by name."""
+    """Get a config by built-in name or YAML path."""
+    from openpi.training import config_loader
+
+    if config_loader.is_yaml_ref(config_name):
+        return config_loader.load_yaml_config(config_name).config
+    return get_builtin_config(config_name)
+
+
+def get_builtin_config(config_name: str) -> TrainConfig:
+    """Get a built-in Python config by name."""
     if config_name not in _CONFIGS_DICT:
         closest = difflib.get_close_matches(config_name, _CONFIGS_DICT.keys(), n=1, cutoff=0.0)
         closest_str = f" Did you mean '{closest[0]}'? " if closest else ""

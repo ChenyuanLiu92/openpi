@@ -1,10 +1,30 @@
 import dataclasses
 
 import jax
+import numpy as np
+import torch
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+class _EpochSampler(torch.utils.data.Sampler):
+    def __init__(self, size: int):
+        self._size = size
+        self.epoch = 0
+        self.epochs: list[int] = []
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        self.epochs.append(epoch)
+
+    def __iter__(self):
+        indices = range(self._size) if self.epoch % 2 == 0 else reversed(range(self._size))
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self._size
 
 
 def test_torch_data_loader():
@@ -32,6 +52,25 @@ def test_torch_data_loader_infinite():
 
     for _ in range(10):
         _ = next(data_iter)
+
+
+def test_torch_data_loader_advances_sampler_epoch():
+    dataset = [{"index": np.asarray(index)} for index in range(4)]
+    sampler = _EpochSampler(len(dataset))
+    loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=2,
+        sampler=sampler,
+        num_batches=4,
+        framework="pytorch",
+    )
+
+    batches = list(loader)
+
+    assert len(loader) == 2
+    assert sampler.epochs == [0, 1]
+    np.testing.assert_array_equal(batches[0]["index"], [0, 1])
+    np.testing.assert_array_equal(batches[2]["index"], [3, 2])
 
 
 def test_torch_data_loader_parallel():
