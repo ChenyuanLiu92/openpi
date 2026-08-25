@@ -216,7 +216,15 @@ def _rank_command(
             str(len(spec.local_device_ids)),
             "--fsdp-devices",
             str(config.fsdp_devices),
+            "--tensor-sizes-mib",
+            ",".join(str(size) for size in config.distributed.diagnostics.tensor_sizes_mib),
+            "--warmup-iterations",
+            str(config.distributed.diagnostics.warmup_iterations),
+            "--measure-iterations",
+            str(config.distributed.diagnostics.measure_iterations),
         ]
+        if not config.distributed.diagnostics.topology_check:
+            command.append("--skip-topology-check")
         if coordinator_bind_address is not None:
             command.extend(["--coordinator-bind-address", coordinator_bind_address])
         return command

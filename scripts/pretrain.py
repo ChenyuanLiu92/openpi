@@ -8,6 +8,7 @@ Run with the optional RLDS dependencies installed:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import logging
 import os
@@ -90,7 +91,7 @@ def _configure_jax_runtime(config: pretrain_config.RuntimeConfig) -> None:
 
 
 def _shard_batch_start(shard) -> int:
-    index = shard.index[0]
+    index = shard.index[1] if np.ndim(shard.data) >= 5 and len(shard.index) > 1 else shard.index[0]
     if isinstance(index, slice):
         return 0 if index.start is None else index.start
     return int(index)
@@ -100,7 +101,10 @@ def _addressable_shard_prefix(shards, *, limit: int) -> np.ndarray:
     chunks: list[np.ndarray] = []
     remaining = limit
     for shard in sorted(shards, key=_shard_batch_start):
-        chunk = np.asarray(jax.device_get(shard.data))[:remaining]
+        chunk = np.asarray(jax.device_get(shard.data))
+        if chunk.ndim >= 5:
+            chunk = chunk.reshape(-1, *chunk.shape[2:])
+        chunk = chunk[:remaining]
         if len(chunk):
             chunks.append(chunk)
             remaining -= len(chunk)
@@ -116,7 +120,10 @@ def _process_local_prefix(array: jax.Array | np.ndarray, *, limit: int) -> np.nd
     if limit <= 0:
         raise ValueError("limit must be positive")
     if not isinstance(array, jax.Array) or array.is_fully_addressable:
-        return np.asarray(jax.device_get(array))[:limit]
+        value = np.asarray(jax.device_get(array))
+        if value.ndim >= 5:
+            value = value.reshape(-1, *value.shape[2:])
+        return value[:limit]
     return _addressable_shard_prefix(array.addressable_shards, limit=limit)
 
 
@@ -226,6 +233,17 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
         raise ValueError(
             f"Global batch size {config.batch_size} must be divisible by global device count {jax.device_count()}"
         )
+    if config.micro_batch_size is None:
+        if config.gradient_accumulation_steps != 1:
+            raise ValueError("micro_batch_size may be null only when gradient_accumulation_steps is 1")
+    else:
+        expected_batch_size = config.micro_batch_size * jax.device_count() * config.gradient_accumulation_steps
+        if config.batch_size != expected_batch_size:
+            raise ValueError(
+                "training batch invariant failed: batch_size must equal micro_batch_size * global_device_count * "
+                f"gradient_accumulation_steps ({config.batch_size} != {config.micro_batch_size} * "
+                f"{jax.device_count()} * {config.gradient_accumulation_steps} = {expected_batch_size})"
+            )
 
     logging.info(
         "JAX compilation cache: enabled=%s dir=%s min_compile_seconds=%s explain_misses=%s",
@@ -237,8 +255,20 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
     rng = jax.random.key(config.seed)
     train_rng, init_rng, validation_rng = jax.random.split(rng, 3)
     mesh = sharding.make_mesh(config.fsdp_devices)
+    if config.distributed.diagnostics.topology_check:
+        gpu_collectives.log_topology_diagnostics()
     gpu_collectives.warmup_collectives(enabled=config.distributed.warmup_collectives, mesh=mesh)
-    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
+    collective_benchmarks = ()
+    if config.distributed.warmup_collectives and jax.device_count() > 1:
+        diagnostics = config.distributed.diagnostics
+        collective_benchmarks = gpu_collectives.benchmark_global_collectives(
+            mesh,
+            tensor_sizes_mib=diagnostics.tensor_sizes_mib,
+            warmup_iterations=diagnostics.warmup_iterations,
+            measure_iterations=diagnostics.measure_iterations,
+        )
+    # The leading axis is the replicated accumulation dimension; DATA_AXIS shards each microbatch.
+    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     checkpoint_manager, resuming = checkpoints.initialize_checkpoint_dir(
@@ -266,6 +296,18 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
     _ACTIVE_OBSERVERS.append(observer)
     observer.log_artifact_metadata("training-inputs", lineage, artifact_type="training-lineage")
     observer.log_code(epath.Path(__file__).parent.parent)
+    for result in collective_benchmarks:
+        prefix = f"communication/{result.operation}/{result.payload_mib:g}mib"
+        observer.log_metrics(
+            {
+                f"{prefix}/median_seconds": result.median_seconds,
+                f"{prefix}/p95_seconds": result.p95_seconds,
+                f"{prefix}/algorithm_gib_per_second": result.algorithm_gib_per_second,
+                f"{prefix}/bus_gib_per_second": result.bus_gib_per_second,
+                f"{prefix}/rank_straggler_ratio": result.rank_straggler_ratio,
+            },
+            step=0,
+        )
 
     signal_count = 0
 
@@ -298,6 +340,18 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
     elif previous_data_state is not None:
         if previous_data_state.get("seed") != config.seed:
             raise ValueError("Cannot statistically resume with a different training seed")
+        previous_topology = previous_data_state.get("topology")
+        current_topology = {
+            "process_count": jax.process_count(),
+            "global_device_count": jax.device_count(),
+            "local_device_count": jax.local_device_count(),
+        }
+        if config.data_resume_mode == "exact" and previous_topology != current_topology:
+            message = f"Exact data resume topology mismatch: checkpoint={previous_topology}, current={current_topology}"
+            if config.on_topology_change == "error":
+                raise ValueError(message)
+            logging.warning("%s; explicitly falling back to statistical data resume", message)
+            config = dataclasses.replace(config, data_resume_mode="statistical")
         initial_counts = previous_data_state.get("consumed_examples_per_source")
         if not isinstance(initial_counts, dict) or set(initial_counts) != set(config.source_indices):
             raise ValueError("Checkpoint data source IDs do not match the current pretraining config")
@@ -348,13 +402,42 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
     log_window_start = time.monotonic()
     data_wait_seconds = 0.0
     observer.mark_progress(start_step)
+    profiler_active = False
+    profiler_stopped = False
+    latest_rank_straggler_ratio = 1.0
     for _ in progress:
         observer.set_phase("training")
+        current_step = int(jax.device_get(state.step))
+        diagnostics = config.distributed.diagnostics
+        if diagnostics.profile_start_step == current_step and not profiler_active and not profiler_stopped:
+            trace_dir = config.observability_root / "jax-traces" / f"rank-{jax.process_index():05d}"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            jax.profiler.start_trace(str(trace_dir))
+            profiler_active = True
         step_started = time.monotonic()
         with sharding.set_mesh(mesh):
             state, info = compiled_train_step(train_rng, state, batch)
         completed_step = int(jax.device_get(state.step))
         step_seconds = time.monotonic() - step_started
+        if jax.process_count() > 1 and (
+            completed_step % config.log_interval == 0 or completed_step == config.num_train_steps
+        ):
+            rank_times = np.asarray(multihost_utils.process_allgather(np.asarray([step_seconds]))).reshape(-1)
+            latest_rank_straggler_ratio = float(np.max(rank_times) / max(np.median(rank_times), 1e-12))
+            if latest_rank_straggler_ratio > diagnostics.straggler_ratio_threshold:
+                observer.alert(
+                    "rank_straggler",
+                    f"Step {completed_step} rank time ratio {latest_rank_straggler_ratio:.2f} exceeds "
+                    f"{diagnostics.straggler_ratio_threshold:.2f}; times={rank_times.tolist()}",
+                )
+        if (
+            profiler_active
+            and diagnostics.profile_start_step is not None
+            and completed_step >= diagnostics.profile_start_step + diagnostics.profile_num_steps
+        ):
+            jax.profiler.stop_trace()
+            profiler_active = False
+            profiler_stopped = True
         observer.set_phase("training", step=completed_step)
         observer.mark_progress(completed_step)
         infos.append(info)
@@ -377,8 +460,10 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
                     "performance/step_seconds": step_seconds,
                     "performance/data_wait_seconds": data_wait_seconds,
                     "performance/samples_per_second": config.batch_size * len(infos) / elapsed,
+                    "performance/rank_straggler_ratio": latest_rank_straggler_ratio,
                 }
             )
+            metrics.update({f"input/{key}": value for key, value in train_loader.metrics(reset_interval=True).items()})
             valid_fraction = float(metrics["train/valid_action_fraction"])
             metrics["performance/valid_actions_per_second"] = (
                 valid_fraction
@@ -459,6 +544,8 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
             batch = next(train_iterator)
             data_wait_seconds += time.monotonic() - data_started
 
+    if profiler_active:
+        jax.profiler.stop_trace()
     logging.info("Waiting for checkpoint manager to finish")
     observer.set_phase("checkpoint", step=int(jax.device_get(state.step)))
     finalize_started = time.monotonic()
@@ -468,6 +555,15 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
         observer.alert("checkpoint_failed", f"Checkpoint finalization failed: {type(exc).__name__}: {exc}")
         raise
     final_step = int(jax.device_get(state.step))
+    if final_step >= config.num_train_steps:
+        final_counts = train_loader.data_state()["consumed_examples_per_source"]
+        shortfalls = {
+            source_id: limit.min_samples - final_counts[source_id]
+            for source_id, limit in config.data.mixing.source_limits.items()
+            if limit.min_samples is not None and final_counts[source_id] < limit.min_samples
+        }
+        if shortfalls:
+            raise RuntimeError(f"Training completed without satisfying source min_samples: {shortfalls}")
     observer.log_metrics(
         {
             "checkpoint/finalize_seconds": time.monotonic() - finalize_started,

@@ -18,8 +18,8 @@
 #      uv run --group rlds scripts/pretrain.py configs/pretraining/pi05/<实验>.yaml \
 #        --exp-name lr_ablation --optimizer.clip-gradient-norm 0.5
 
-# schema 版本；当前只支持 1。
-schema_version: 1
+# schema 版本；v2 增加输入流水线、梯度累积、动态混合、精确恢复和通信诊断。
+schema_version: 2
 
 # 配置种类；预训练入口只接受 pi05_pretrain。
 kind: pi05_pretrain
@@ -92,6 +92,38 @@ data:
 
   # batch 后预取的 batch 数，必须为正整数。
   prefetch_batches: 4
+
+  # Python/host 到 device 的有界输入流水线。
+  pipeline:
+    # SentencePiece 批量编码使用的 CPU 线程数。
+    tokenizer_threads: 8
+    # host 内存中提前完成 decode、tokenize 和 NumPy 转换的 batch 数；0 表示同步处理。
+    host_prefetch_batches: 4
+    # 提前提交到 JAX device 的 batch 数；0 表示仅在消费时提交。
+    device_prefetch_batches: 2
+    # fail 立即失败；skip 跳过坏 batch；quarantine 跳过并写入脱敏错误记录。
+    # 当 mixing.source_failure_policy=degrade 时，source 降级逻辑优先，坏 batch 会被跳过并累计 source 失败次数。
+    bad_sample_policy: fail
+    # 熔断统计窗口（处理过的 batch 数）。
+    bad_sample_window: 1000
+    # 窗口内允许的坏 batch 绝对数；fail 策略仍会在第一个错误立即失败。
+    max_bad_samples: 10
+    # 窗口内允许的坏 batch 比例，超过绝对数或比例任一阈值即熔断。
+    max_bad_fraction: 0.01
+    # quarantine 策略的 JSONL 目录；记录 source、异常和 prompt 哈希，不写原始图像/文本。
+    quarantine_dir: null
+
+  # 动态数据混合策略。静态实验可保留空 schedule。
+  mixing:
+    # step 在节点处切换；linear 在相邻节点间线性插值温度和权重。
+    interpolation: step
+    # 每个节点的 step 是 optimizer step；weights 可只覆盖需要改变的 source。
+    schedule: []
+    # 按 source ID 配置概率边界和整个 run 的样本上下限；未列出的 source 不加约束。
+    source_limits: {}
+    # fail 在数据源异常时终止；degrade 连续失败达到阈值后在本次 run 中移除该 source 并重归一化。
+    source_failure_policy: fail
+    consecutive_failure_threshold: 3
 
   # 所有数据源。需要混训时复制整个 “- id: ...” block；id 必须唯一。
   sources:
@@ -205,6 +237,13 @@ training:
   # 所有 host/device 合计的全局 batch size，必须能被全局 JAX device 数整除。
   batch_size: 256
 
+  # 每张 device 每个 microstep 的样本数；null 表示兼容旧行为（每步只做一次前后向）。
+  # 非 null 时必须满足 batch_size = micro_batch_size × 全局 device 数 × gradient_accumulation_steps。
+  micro_batch_size: 4
+
+  # 累积多少个 microbatch 后才更新 optimizer/EMA/step。
+  gradient_accumulation_steps: 8
+
   # optimizer 更新总步数。
   num_train_steps: 1000000
 
@@ -235,6 +274,12 @@ checkpoint:
 
   # true 从最新 checkpoint 精确恢复 model/optimizer/EMA/step；数据流按记录计数做统计恢复。
   resume: false
+
+  # statistical 只恢复采样统计；exact 在相同进程/device 拓扑下恢复确定性 mixer/iterator 位置。
+  data_resume_mode: exact
+
+  # exact checkpoint 遇到不同拓扑时：error 拒绝启动；statistical 明确降级为统计恢复。
+  on_topology_change: statistical
 
 # 日志的全部字段。
 logging:
@@ -327,6 +372,22 @@ distributed:
 
   # jax.distributed.initialize 超时时间，单位秒。
   initialization_timeout: 300
+
+  # 启动和运行期间的通信性能诊断。
+  diagnostics:
+    # 检查 GPU/NIC/NUMA 可见性和常见 NCCL 网卡绑定错误。
+    topology_check: true
+    # 对每种 payload 测 AllReduce、AllGather、ReduceScatter；单位 MiB。
+    tensor_sizes_mib: [1, 16, 64, 256]
+    # 每种 collective/size 的预热次数和计时次数。
+    warmup_iterations: 2
+    measure_iterations: 5
+    # 最慢 rank 耗时 / rank 中位数超过该值时报告 straggler。
+    straggler_ratio_threshold: 1.5
+    # 非 null 时从指定 optimizer step 开始写 JAX profiler trace。
+    profile_start_step: null
+    # trace 覆盖的 optimizer step 数，用于分析真实通信/计算 overlap。
+    profile_num_steps: 5
 
 # validation 的全部字段。
 validation:

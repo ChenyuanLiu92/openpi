@@ -173,7 +173,18 @@ def _write_config(
             "sources": sources,
         }
     )
-    contents["training"].update({"batch_size": 8, "num_train_steps": 1, "ema_decay": None})
+    contents["data"]["pipeline"].update(
+        {"tokenizer_threads": 2, "host_prefetch_batches": 1, "device_prefetch_batches": 1}
+    )
+    contents["training"].update(
+        {
+            "batch_size": 8,
+            "micro_batch_size": None,
+            "gradient_accumulation_steps": 1,
+            "num_train_steps": 1,
+            "ema_decay": None,
+        }
+    )
     contents["paths"] = {
         "assets_base_dir": str(work_dir / "assets"),
         "checkpoint_base_dir": str(work_dir / "checkpoints"),
@@ -197,6 +208,14 @@ def _write_config(
             "process_id": None,
             "local_device_ids": None,
             "cluster_detection_method": None,
+        }
+    )
+    contents["distributed"]["diagnostics"].update(
+        {
+            "topology_check": False,
+            "tensor_sizes_mib": [0.25],
+            "warmup_iterations": 0,
+            "measure_iterations": 1,
         }
     )
     contents["validation"] = {"interval_steps": 1, "batches_per_source": 1}

@@ -20,6 +20,52 @@ class PaligemmaTokenizer:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
     def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        tokens = self._tokenize_unpadded(prompt, state)
+        return self._pad(tokens)
+
+    def tokenize_batch(
+        self,
+        prompts: list[str],
+        states: list[np.ndarray | None] | None = None,
+        *,
+        num_threads: int = 1,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize a batch with SentencePiece's native parallel encoder."""
+        if states is None:
+            states = [None] * len(prompts)
+        if len(prompts) != len(states):
+            raise ValueError("prompts and states must have equal lengths")
+        encoded_prompts: list[str] = []
+        append_newline: list[bool] = []
+        for prompt, state in zip(prompts, states, strict=True):
+            cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+            if state is not None:
+                discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+                state_str = " ".join(map(str, discretized_state))
+                encoded_prompts.append(f"Task: {cleaned_text}, State: {state_str};\nAction: ")
+                append_newline.append(False)
+            else:
+                encoded_prompts.append(cleaned_text)
+                append_newline.append(True)
+        encoded = self._tokenizer.encode(
+            encoded_prompts,
+            add_bos=True,
+            num_threads=num_threads,
+        )
+        newline = self._tokenizer.encode("\n")
+        padded = [
+            self._pad(tokens + newline if add_newline else tokens)
+            for tokens, add_newline in zip(encoded, append_newline, strict=True)
+        ]
+        if not padded:
+            return (
+                np.empty((0, self._max_len), dtype=np.int32),
+                np.empty((0, self._max_len), dtype=bool),
+            )
+        tokens, masks = zip(*padded, strict=True)
+        return np.stack(tokens).astype(np.int32), np.stack(masks).astype(bool)
+
+    def _tokenize_unpadded(self, prompt: str, state: np.ndarray | None) -> list[int]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         if state is not None:
             # This is the Pi05 format, where the state is part of the discrete language input.
@@ -31,6 +77,9 @@ class PaligemmaTokenizer:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
             # tokenize "\n" separately as the "start of answer" token
             tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
+        return tokens
+
+    def _pad(self, tokens: list[int]) -> tuple[np.ndarray, np.ndarray]:
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
             padding = [False] * (self._max_len - tokens_len)
@@ -45,7 +94,7 @@ class PaligemmaTokenizer:
             tokens = tokens[: self._max_len]
             mask = [True] * self._max_len
 
-        return np.asarray(tokens), np.asarray(mask)
+        return np.asarray(tokens, dtype=np.int32), np.asarray(mask, dtype=bool)
 
 
 class FASTTokenizer:

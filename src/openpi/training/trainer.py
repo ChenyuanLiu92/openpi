@@ -103,29 +103,55 @@ def pretrain_step(
     state: training_utils.TrainState,
     batch: rlds_mixture.PretrainBatch,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
-    """Masked pi0.5 flow-matching step with static per-source metrics."""
+    """Masked pi0.5 step with one optimizer update over accumulated microbatches."""
     model = nnx.merge(state.model_def, state.params)
     model.train()
-    time_mask = jnp.any(batch.action_mask, axis=-1)
 
     def loss_fn(model: _model.BaseModel, key: at.KeyArrayLike):
-        chunked_loss = model.compute_loss(
-            key,
-            batch.observation,
-            batch.actions,
-            train=True,
-            action_mask=batch.action_mask,
-        )
-        loss = _masked_mean(chunked_loss, time_mask)
-        return loss, chunked_loss
+        loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        valid_count = jnp.asarray(0.0, dtype=jnp.float32)
+        valid_actions = jnp.asarray(0.0, dtype=jnp.float32)
+        action_elements = jnp.asarray(0.0, dtype=jnp.float32)
+        source_loss_sums = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
+        source_valid_counts = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
+        source_examples = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
+        for micro_index in range(config.gradient_accumulation_steps):
+            micro = jax.tree.map(lambda value, index=micro_index: value[index], batch)
+            chunked_loss = model.compute_loss(
+                jax.random.fold_in(key, micro_index),
+                micro.observation,
+                micro.actions,
+                train=True,
+                action_mask=micro.action_mask,
+            )
+            time_mask = jnp.any(micro.action_mask, axis=-1)
+            numeric_mask = time_mask.astype(jnp.float32)
+            loss_sum += jnp.sum(chunked_loss * numeric_mask)
+            valid_count += jnp.sum(numeric_mask)
+            valid_actions += jnp.sum(micro.action_mask)
+            action_elements += micro.action_mask.size
+            for source_index in range(len(config.data.sources)):
+                example_mask = micro.source_id == source_index
+                source_mask = numeric_mask * example_mask[:, None]
+                source_loss_sums = source_loss_sums.at[source_index].add(jnp.sum(chunked_loss * source_mask))
+                source_valid_counts = source_valid_counts.at[source_index].add(jnp.sum(source_mask))
+                source_examples = source_examples.at[source_index].add(jnp.sum(example_mask))
+        loss = loss_sum / jnp.clip(valid_count, 1)
+        aux = (valid_actions / jnp.clip(action_elements, 1), source_loss_sums, source_valid_counts, source_examples)
+        return loss, aux
 
     train_rng = jax.random.fold_in(rng, state.step)
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    (loss, chunked_loss), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, train_rng)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, train_rng)
     new_state, model = _apply_gradients(config, state, model, grads)
     metrics = _base_metrics(model, loss, grads)
-    metrics["valid_action_fraction"] = jnp.mean(batch.action_mask)
-    metrics.update(_source_metrics(config, chunked_loss, time_mask, batch.source_id))
+    valid_action_fraction, source_loss_sums, source_valid_counts, source_examples = aux
+    metrics["valid_action_fraction"] = valid_action_fraction
+    total_examples = jnp.sum(source_examples)
+    for index, source in enumerate(config.data.sources):
+        metrics[f"source/{source.id}/loss_sum"] = source_loss_sums[index]
+        metrics[f"source/{source.id}/valid_count"] = source_valid_counts[index]
+        metrics[f"source/{source.id}/fraction"] = source_examples[index] / jnp.clip(total_examples, 1)
     return new_state, metrics
 
 
@@ -138,16 +164,36 @@ def validation_step(
     """No-gradient, augmentation-free validation on current parameters."""
     model = nnx.merge(state.model_def, state.params)
     model.eval()
-    chunked_loss = model.compute_loss(
-        rng,
-        batch.observation,
-        batch.actions,
-        train=False,
-        action_mask=batch.action_mask,
-    )
-    time_mask = jnp.any(batch.action_mask, axis=-1)
-    metrics = {"loss": _masked_mean(chunked_loss, time_mask)}
-    metrics.update(_source_metrics(config, chunked_loss, time_mask, batch.source_id))
+    loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    valid_count = jnp.asarray(0.0, dtype=jnp.float32)
+    source_loss_sums = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
+    source_valid_counts = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
+    source_examples = jnp.zeros(len(config.data.sources), dtype=jnp.float32)
+    for micro_index in range(config.gradient_accumulation_steps):
+        micro = jax.tree.map(lambda value, index=micro_index: value[index], batch)
+        chunked_loss = model.compute_loss(
+            jax.random.fold_in(rng, micro_index),
+            micro.observation,
+            micro.actions,
+            train=False,
+            action_mask=micro.action_mask,
+        )
+        time_mask = jnp.any(micro.action_mask, axis=-1)
+        numeric_mask = time_mask.astype(jnp.float32)
+        loss_sum += jnp.sum(chunked_loss * numeric_mask)
+        valid_count += jnp.sum(numeric_mask)
+        for source_index in range(len(config.data.sources)):
+            example_mask = micro.source_id == source_index
+            source_mask = numeric_mask * example_mask[:, None]
+            source_loss_sums = source_loss_sums.at[source_index].add(jnp.sum(chunked_loss * source_mask))
+            source_valid_counts = source_valid_counts.at[source_index].add(jnp.sum(source_mask))
+            source_examples = source_examples.at[source_index].add(jnp.sum(example_mask))
+    metrics = {"loss": loss_sum / jnp.clip(valid_count, 1)}
+    total_examples = jnp.sum(source_examples)
+    for index, source in enumerate(config.data.sources):
+        metrics[f"source/{source.id}/loss_sum"] = source_loss_sums[index]
+        metrics[f"source/{source.id}/valid_count"] = source_valid_counts[index]
+        metrics[f"source/{source.id}/fraction"] = source_examples[index] / jnp.clip(total_examples, 1)
     return metrics
 
 

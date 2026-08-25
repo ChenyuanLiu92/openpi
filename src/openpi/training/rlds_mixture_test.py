@@ -6,6 +6,7 @@ import types
 import numpy as np
 import pytest
 
+from openpi.training import pretrain_config
 from openpi.training import pretrain_config_loader
 from openpi.training import rlds_adapters
 from openpi.training import rlds_mixture
@@ -76,3 +77,129 @@ def test_build_lineage_inherits_conversion_lineage_id(tmp_path):
 
     assert lineage["lineage_id"] == "conversion-123"
     assert lineage["datasets"][source.id]["conversion_lineage_id"] == "conversion-123"
+
+
+class _FakeDataset:
+    def __init__(self, batches):
+        self._batches = batches
+
+    def as_numpy_iterator(self):
+        return iter(self._batches)
+
+
+class _FakeTokenizer:
+    def __init__(self, max_len):
+        self._max_len = max_len
+
+    def tokenize_batch(self, prompts, states, *, num_threads):
+        del states, num_threads
+        return (
+            np.ones((len(prompts), self._max_len), dtype=np.int32),
+            np.ones((len(prompts), self._max_len), dtype=bool),
+        )
+
+
+def _numpy_batch(batch_size: int, action_dim: int, horizon: int):
+    return {
+        "image": {"base_0_rgb": np.zeros((batch_size, 4, 4, 3), dtype=np.float32)},
+        "image_mask": {"base_0_rgb": np.ones(batch_size, dtype=bool)},
+        "state": np.zeros((batch_size, action_dim), dtype=np.float32),
+        "actions": np.zeros((batch_size, horizon, action_dim), dtype=np.float32),
+        "action_mask": np.ones((batch_size, horizon, action_dim), dtype=bool),
+        "prompt": np.asarray([b"move"] * batch_size),
+        "source_id": np.zeros(batch_size, dtype=np.int32),
+    }
+
+
+def test_loader_prefetches_batch_tokenization_and_reshapes_microbatches(monkeypatch):
+    config, _ = _small_config()
+    pipeline = dataclasses.replace(config.data.pipeline, host_prefetch_batches=2, device_prefetch_batches=1)
+    config = dataclasses.replace(
+        config,
+        batch_size=4,
+        micro_batch_size=2,
+        gradient_accumulation_steps=2,
+        data=dataclasses.replace(config.data, pipeline=pipeline),
+    )
+    monkeypatch.setattr(rlds_mixture._tokenizer, "PaligemmaTokenizer", _FakeTokenizer)  # noqa: SLF001
+    loader = rlds_mixture.RldsMixtureDataLoader(
+        config,
+        _FakeDataset([_numpy_batch(4, config.model.action_dim, config.model.action_horizon)] * 4),
+        sharding=None,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.actions.shape == (2, 2, 3, 5)
+    assert batch.observation.tokenized_prompt.shape == (2, 2, config.model.max_token_len)
+    assert loader.data_state()["consumed_examples_per_source"] == {"example_robot": 4}
+    assert loader.metrics()["consumed_batches"] == 1
+
+
+def test_dynamic_weight_stream_changes_at_optimizer_step():
+    config, source = _small_config()
+    second = dataclasses.replace(source, id="second", weight=1.0)
+    mixing = dataclasses.replace(
+        config.data.mixing,
+        schedule=(pretrain_config.MixingSchedulePoint(step=1, temperature=1.0, weights={source.id: 9.0}),),
+    )
+    config = dataclasses.replace(config, data=dataclasses.replace(config.data, sources=(source, second), mixing=mixing))
+
+    stream = rlds_mixture._dynamic_weight_dataset(  # noqa: SLF001
+        config, local_batch_size=1, start_step=0, tf=tf
+    ).take(2)
+    values = list(stream.as_numpy_iterator())
+
+    np.testing.assert_allclose(values[0], [0.5, 0.5])
+    np.testing.assert_allclose(values[1], [0.9, 0.1])
+
+
+def test_source_probability_bounds_are_projected_without_schedule():
+    config, source = _small_config()
+    second = dataclasses.replace(source, id="second", weight=9.0)
+    limits = {
+        source.id: pretrain_config.SourceLimit(0.3, 0.4, None, None),
+        second.id: pretrain_config.SourceLimit(0.0, 0.7, None, None),
+    }
+    mixing = dataclasses.replace(config.data.mixing, source_limits=limits)
+    config = dataclasses.replace(config, data=dataclasses.replace(config.data, sources=(source, second), mixing=mixing))
+
+    assert config.data.effective_probabilities() == pytest.approx((0.3, 0.7))
+    values = list(
+        rlds_mixture._dynamic_weight_dataset(config, local_batch_size=1, start_step=0, tf=tf)  # noqa: SLF001
+        .take(1)
+        .as_numpy_iterator()
+    )
+    np.testing.assert_allclose(values[0], [0.3, 0.7], atol=1e-6)
+
+
+def test_degraded_source_is_removed_from_dynamic_weights():
+    config, source = _small_config()
+    second = dataclasses.replace(source, id="second")
+    mixing = dataclasses.replace(
+        config.data.mixing,
+        source_failure_policy="degrade",
+        consecutive_failure_threshold=1,
+    )
+    config = dataclasses.replace(config, data=dataclasses.replace(config.data, sources=(source, second), mixing=mixing))
+    runtime = rlds_mixture._MixtureRuntime(config, None)  # noqa: SLF001
+    weights = rlds_mixture._dynamic_weight_dataset(  # noqa: SLF001
+        config,
+        local_batch_size=1,
+        start_step=0,
+        tf=tf,
+        mixture_runtime=runtime,
+    )
+
+    assert runtime.record_failure(np.asarray([0], dtype=np.int32)) == (source.id,)
+    value = next(iter(weights.as_numpy_iterator()))
+
+    np.testing.assert_allclose(value, [0.0, 1.0], atol=1e-6)
+
+
+def test_global_sample_limit_is_partitioned_across_ranks(monkeypatch):
+    monkeypatch.setattr(rlds_mixture.jax, "process_count", lambda: 3)
+    monkeypatch.setattr(rlds_mixture.jax, "process_index", lambda: 1)
+
+    # Seven samples remain globally: rank quotas are [3, 2, 2].
+    assert rlds_mixture._local_remaining_quota(12, 5) == 2  # noqa: SLF001
