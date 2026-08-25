@@ -32,6 +32,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--local-device-ids", help="Comma-separated physical GPU IDs assigned to this rank.")
     parser.add_argument("--fsdp-devices", type=int, help="FSDP mesh width; defaults to all global devices.")
     parser.add_argument("--initialization-timeout", type=int, default=300)
+    parser.add_argument(
+        "--tensor-sizes-mib",
+        default="1,16,64,256",
+        help="Comma-separated payload sizes for bandwidth benchmarks (default: 1,16,64,256).",
+    )
+    parser.add_argument("--warmup-iterations", type=int, default=2)
+    parser.add_argument("--measure-iterations", type=int, default=5)
+    parser.add_argument("--skip-bandwidth", action="store_true")
+    parser.add_argument("--skip-topology-check", action="store_true")
     return parser.parse_args()
 
 
@@ -73,6 +82,8 @@ def main() -> None:
     if args.expected_device_count is not None and len(devices) != args.expected_device_count:
         raise RuntimeError(f"Expected {args.expected_device_count} JAX devices, but found {len(devices)}: {devices}")
 
+    if not args.skip_topology_check:
+        gpu_collectives.log_topology_diagnostics()
     gpu_collectives.log_cuda_cache_configuration(devices)
     result = gpu_collectives.run_local_fsdp_collective_probe(
         devices=devices,
@@ -101,6 +112,16 @@ def main() -> None:
             global_result.global_device_count,
             global_result.expected_sum,
             ", ".join(f"{elapsed:.3f}s" for elapsed in global_result.elapsed_seconds),
+        )
+    if not args.skip_bandwidth and jax.device_count() > 1:
+        fsdp_devices = args.fsdp_devices or jax.device_count()
+        mesh = sharding.make_mesh(fsdp_devices)
+        sizes = tuple(float(value) for value in args.tensor_sizes_mib.split(",") if value)
+        gpu_collectives.benchmark_global_collectives(
+            mesh,
+            tensor_sizes_mib=sizes,
+            warmup_iterations=args.warmup_iterations,
+            measure_iterations=args.measure_iterations,
         )
 
 

@@ -36,6 +36,112 @@ class GlobalCollectiveProbeResult:
     elapsed_seconds: tuple[float, ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class CollectiveBandwidthResult:
+    operation: str
+    payload_mib: float
+    median_seconds: float
+    p95_seconds: float
+    algorithm_gib_per_second: float
+    bus_gib_per_second: float
+    rank_straggler_ratio: float
+
+
+def log_topology_diagnostics() -> dict[str, str]:
+    """Log GPU/NIC visibility and flag invalid explicit NCCL interface bindings."""
+    interfaces = sorted(path.name for path in pathlib.Path("/sys/class/net").glob("*") if path.name != "lo")
+    binding = os.environ.get("NCCL_SOCKET_IFNAME")
+    status = {
+        "hostname": os.uname().nodename,
+        "network_interfaces": ",".join(interfaces),
+        "nccl_socket_ifname": binding or "<auto>",
+        "nccl_ib_hca": os.environ.get("NCCL_IB_HCA", "<auto>"),
+        "nccl_cross_nic": os.environ.get("NCCL_CROSS_NIC", "<default>"),
+    }
+    logging.info("Communication topology: %s", status)
+    if binding:
+        requested = [item.lstrip("^=") for item in binding.split(",")]
+        positive = [item for item in requested if item and not binding.startswith("^")]
+        if positive and not any(any(name.startswith(prefix) for name in interfaces) for prefix in positive):
+            raise RuntimeError(
+                f"NCCL_SOCKET_IFNAME={binding!r} does not match visible interfaces {interfaces}; "
+                "fix the launcher NIC binding before training"
+            )
+    return status
+
+
+def benchmark_global_collectives(
+    mesh: jax.sharding.Mesh,
+    *,
+    tensor_sizes_mib: Sequence[float],
+    warmup_iterations: int,
+    measure_iterations: int,
+) -> tuple[CollectiveBandwidthResult, ...]:
+    """Measure AllReduce/AllGather/ReduceScatter over the complete global mesh."""
+    if warmup_iterations < 0 or measure_iterations <= 0:
+        raise ValueError("warmup_iterations must be non-negative and measure_iterations positive")
+    axis_names = tuple(mesh.axis_names)
+    device_count = int(mesh.size)
+    results = []
+    for payload_mib in tensor_sizes_mib:
+        elements = _round_up_to_multiple(max(1, int(payload_mib * 1024**2 / 4)), device_count)
+        for operation in ("all_reduce", "all_gather", "reduce_scatter"):
+
+            def collective(_trigger, *, _operation=operation, _elements=elements):
+                value = jnp.ones((_elements,), dtype=jnp.float32)
+                if _operation == "all_reduce":
+                    return jax.lax.psum(value, axis_names)
+                if _operation == "all_gather":
+                    return jax.lax.all_gather(value, axis_names, axis=0, tiled=True)
+                return jax.lax.psum_scatter(value, axis_names, scatter_dimension=0, tiled=True)
+
+            output_spec = (
+                jax.sharding.PartitionSpec(axis_names)
+                if operation == "reduce_scatter"
+                else jax.sharding.PartitionSpec()
+            )
+            mapped = shard_map(
+                collective,
+                mesh=mesh,
+                in_specs=jax.sharding.PartitionSpec(),
+                out_specs=output_spec,
+                check_rep=False,
+            )
+            compiled = jax.jit(mapped)
+            for _ in range(warmup_iterations):
+                jax.block_until_ready(compiled(jnp.asarray(0, dtype=jnp.int32)))
+            timings = []
+            straggler_ratios = []
+            for _ in range(measure_iterations):
+                started = time.monotonic()
+                jax.block_until_ready(compiled(jnp.asarray(0, dtype=jnp.int32)))
+                elapsed = time.monotonic() - started
+                rank_times = np.asarray(multihost_utils.process_allgather(np.asarray([elapsed]))).reshape(-1)
+                timings.append(float(np.max(rank_times)))
+                straggler_ratios.append(float(np.max(rank_times) / max(np.median(rank_times), 1e-12)))
+            median = float(np.median(timings))
+            payload_bytes = elements * 4
+            algorithm_bw = payload_bytes / median / 1024**3
+            factor = (
+                2 * (device_count - 1) / device_count
+                if operation == "all_reduce"
+                else (device_count - 1) / device_count
+            )
+            result = CollectiveBandwidthResult(
+                operation=operation,
+                payload_mib=payload_bytes / 1024**2,
+                median_seconds=median,
+                p95_seconds=float(np.percentile(timings, 95)),
+                algorithm_gib_per_second=algorithm_bw,
+                bus_gib_per_second=algorithm_bw * factor,
+                rank_straggler_ratio=max(straggler_ratios),
+            )
+            logging.info("Collective bandwidth: %s", dataclasses.asdict(result))
+            results.append(result)
+    multihost_utils.sync_global_devices("collective_bandwidth_benchmark_complete")
+    return tuple(results)
+
+
 def log_cuda_cache_configuration(devices: Sequence[jax.Device] | None = None) -> None:
     """Log CUDA JIT-cache settings and warn about settings that make cold starts repeat."""
     devices = tuple(jax.local_devices() if devices is None else devices)

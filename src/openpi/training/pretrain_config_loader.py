@@ -20,7 +20,8 @@ from openpi.models import pi0_config
 from openpi.training import optimizer
 from openpi.training import pretrain_config as _config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 KIND = "pi05_pretrain"
 
 
@@ -55,6 +56,7 @@ class ResolvedPretrainConfig:
     def snapshot(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
+            "source_schema_version": self.manifest.get("schema_version"),
             "kind": KIND,
             "name": self.config.name,
             "source": self.source,
@@ -128,8 +130,9 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         "policy_metadata",
     }
     _check_keys(contents, top_fields, top_fields, "config")
-    if contents["schema_version"] != SCHEMA_VERSION:
-        raise ConfigError(f"Unsupported schema_version {contents['schema_version']!r}; expected {SCHEMA_VERSION}")
+    source_schema = contents["schema_version"]
+    if source_schema not in SUPPORTED_SCHEMA_VERSIONS:
+        raise ConfigError(f"Unsupported schema_version {source_schema!r}; expected one of {SUPPORTED_SCHEMA_VERSIONS}")
     if contents["kind"] != KIND:
         raise ConfigError(f"Unsupported kind {contents['kind']!r}; expected {KIND!r}")
 
@@ -152,15 +155,20 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         "num_parallel_reads",
         "num_parallel_calls",
         "prefetch_batches",
+        "pipeline",
+        "mixing",
         "sources",
     }
-    _check_keys(data_payload, data_fields, data_fields, "data")
+    legacy_data_fields = data_fields - {"pipeline", "mixing"}
+    _check_keys(data_payload, data_fields, data_fields if source_schema == 2 else legacy_data_fields, "data")
     if data_payload["type"] != "rlds_mixture":
         raise ConfigError("data.type must be 'rlds_mixture'")
     source_values = data_payload["sources"]
     if not isinstance(source_values, list) or not source_values:
         raise ConfigError("data.sources must be a non-empty list")
     sources = tuple(_build_source(value, index) for index, value in enumerate(source_values))
+    pipeline = _build_pipeline(data_payload.get("pipeline"), source_schema=source_schema)
+    mixing = _build_mixing(data_payload.get("mixing"), sources=sources, source_schema=source_schema)
     data = _config.RldsMixtureConfig(
         type="rlds_mixture",
         temperature=_number(data_payload["temperature"], "data.temperature"),
@@ -168,6 +176,8 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         num_parallel_reads=_integer(data_payload["num_parallel_reads"], "data.num_parallel_reads"),
         num_parallel_calls=_integer(data_payload["num_parallel_calls"], "data.num_parallel_calls"),
         prefetch_batches=_integer(data_payload["prefetch_batches"], "data.prefetch_batches"),
+        pipeline=pipeline,
+        mixing=mixing,
         sources=sources,
     )
 
@@ -179,19 +189,48 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
     optimizer_config = _build_component(
         contents["optimizer"], "optimizer", {"adamw": optimizer.AdamW(), "sgd": optimizer.SGD()}
     )
-    training = _section(
-        contents["training"],
-        "training",
-        {"seed", "batch_size", "num_train_steps", "ema_decay"},
-        nullable={"ema_decay"},
+    training_fields = {
+        "seed",
+        "batch_size",
+        "micro_batch_size",
+        "gradient_accumulation_steps",
+        "num_train_steps",
+        "ema_decay",
+    }
+    training_required = (
+        training_fields
+        if source_schema == 2
+        else training_fields
+        - {
+            "micro_batch_size",
+            "gradient_accumulation_steps",
+        }
     )
+    training = dict(_mapping(contents["training"], "training"))
+    _check_keys(training, training_fields, training_required, "training")
+    training = {"micro_batch_size": None, "gradient_accumulation_steps": 1, **training}
     paths = _section(contents["paths"], "paths", {"assets_base_dir", "checkpoint_base_dir"})
-    checkpoint = _section(
-        contents["checkpoint"],
-        "checkpoint",
-        {"exp_name", "save_interval", "keep_period", "overwrite", "resume"},
-        nullable={"keep_period"},
+    checkpoint_fields = {
+        "exp_name",
+        "save_interval",
+        "keep_period",
+        "overwrite",
+        "resume",
+        "data_resume_mode",
+        "on_topology_change",
+    }
+    checkpoint_required = (
+        checkpoint_fields
+        if source_schema == 2
+        else checkpoint_fields
+        - {
+            "data_resume_mode",
+            "on_topology_change",
+        }
     )
+    checkpoint = dict(_mapping(contents["checkpoint"], "checkpoint"))
+    _check_keys(checkpoint, checkpoint_fields, checkpoint_required, "checkpoint")
+    checkpoint = {"data_resume_mode": "statistical", "on_topology_change": "statistical", **checkpoint}
     logging_required = {"project_name", "wandb_enabled", "log_interval"}
     logging_defaults = {
         "wandb_mode": "online",
@@ -228,11 +267,12 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
     distributed_payload = dict(_mapping(contents["distributed"], "distributed"))
     _check_keys(
         distributed_payload,
-        distributed_required | {"coordinator_bind_address"},
-        distributed_required,
+        distributed_required | {"coordinator_bind_address", "diagnostics"},
+        distributed_required | ({"diagnostics"} if source_schema == 2 else set()),
         "distributed",
     )
     distributed = {"coordinator_bind_address": None, **distributed_payload}
+    diagnostics = _build_diagnostics(distributed.get("diagnostics"), source_schema=source_schema)
     runtime_payload = _section(
         contents["runtime"],
         "runtime",
@@ -268,6 +308,16 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         ema_decay=_nullable_number(training["ema_decay"], "training.ema_decay"),
         seed=_integer(training["seed"], "training.seed"),
         batch_size=_integer(training["batch_size"], "training.batch_size"),
+        micro_batch_size=_nullable_integer(training["micro_batch_size"], "training.micro_batch_size"),
+        gradient_accumulation_steps=_integer(
+            training["gradient_accumulation_steps"], "training.gradient_accumulation_steps"
+        ),
+        data_resume_mode=_literal(
+            checkpoint["data_resume_mode"], "checkpoint.data_resume_mode", {"statistical", "exact"}
+        ),
+        on_topology_change=_literal(
+            checkpoint["on_topology_change"], "checkpoint.on_topology_change", {"error", "statistical"}
+        ),
         num_train_steps=_integer(training["num_train_steps"], "training.num_train_steps"),
         assets_base_dir=_string(paths["assets_base_dir"], "paths.assets_base_dir"),
         checkpoint_base_dir=_string(paths["checkpoint_base_dir"], "paths.checkpoint_base_dir"),
@@ -314,6 +364,7 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
             initialization_timeout=_integer(
                 distributed["initialization_timeout"], "distributed.initialization_timeout"
             ),
+            diagnostics=diagnostics,
         ),
         runtime=_config.RuntimeConfig(
             compilation_cache=_config.CompilationCacheConfig(
@@ -369,6 +420,135 @@ def _build_source(value: Any, index: int) -> _config.RldsSourceConfig:
         state_dim=_integer(payload["state_dim"], f"{path}.state_dim"),
         action_dim=_integer(payload["action_dim"], f"{path}.action_dim"),
         adapter=_config.AdapterConfig(_string(adapter_payload["type"], f"{path}.adapter.type"), options),
+    )
+
+
+def _build_pipeline(value: Any, *, source_schema: int) -> _config.PipelineConfig:
+    if value is None and source_schema == 1:
+        return _config.PipelineConfig(1, 0, 0, "fail", 1000, 1, 0.0, None)
+    fields = {
+        "tokenizer_threads",
+        "host_prefetch_batches",
+        "device_prefetch_batches",
+        "bad_sample_policy",
+        "bad_sample_window",
+        "max_bad_samples",
+        "max_bad_fraction",
+        "quarantine_dir",
+    }
+    payload = _section(value, "data.pipeline", fields, nullable={"quarantine_dir"})
+    return _config.PipelineConfig(
+        tokenizer_threads=_integer(payload["tokenizer_threads"], "data.pipeline.tokenizer_threads"),
+        host_prefetch_batches=_integer(payload["host_prefetch_batches"], "data.pipeline.host_prefetch_batches"),
+        device_prefetch_batches=_integer(payload["device_prefetch_batches"], "data.pipeline.device_prefetch_batches"),
+        bad_sample_policy=_literal(
+            payload["bad_sample_policy"], "data.pipeline.bad_sample_policy", {"fail", "skip", "quarantine"}
+        ),
+        bad_sample_window=_integer(payload["bad_sample_window"], "data.pipeline.bad_sample_window"),
+        max_bad_samples=_integer(payload["max_bad_samples"], "data.pipeline.max_bad_samples"),
+        max_bad_fraction=_number(payload["max_bad_fraction"], "data.pipeline.max_bad_fraction"),
+        quarantine_dir=_nullable_string(payload["quarantine_dir"], "data.pipeline.quarantine_dir"),
+    )
+
+
+def _build_mixing(
+    value: Any, *, sources: tuple[_config.RldsSourceConfig, ...], source_schema: int
+) -> _config.MixingConfig:
+    if value is None and source_schema == 1:
+        return _config.MixingConfig("step", (), {}, "fail", 1)
+    fields = {
+        "interpolation",
+        "schedule",
+        "source_limits",
+        "source_failure_policy",
+        "consecutive_failure_threshold",
+    }
+    payload = _section(value, "data.mixing", fields)
+    schedule_values = payload["schedule"]
+    if not isinstance(schedule_values, list):
+        raise ConfigError("data.mixing.schedule must be a list")
+    schedule = []
+    for index, item in enumerate(schedule_values):
+        point = _section(item, f"data.mixing.schedule[{index}]", {"step", "temperature", "weights"})
+        weights = dict(_mapping(point["weights"], f"data.mixing.schedule[{index}].weights"))
+        schedule.append(
+            _config.MixingSchedulePoint(
+                _integer(point["step"], f"data.mixing.schedule[{index}].step"),
+                _number(point["temperature"], f"data.mixing.schedule[{index}].temperature"),
+                {
+                    _string(key, f"data.mixing.schedule[{index}].weights key"): _number(
+                        weight, f"data.mixing.schedule[{index}].weights.{key}"
+                    )
+                    for key, weight in weights.items()
+                },
+            )
+        )
+    limits_payload = _mapping(payload["source_limits"], "data.mixing.source_limits")
+    limits = {}
+    for source_id, item in limits_payload.items():
+        limit = _section(
+            item,
+            f"data.mixing.source_limits.{source_id}",
+            {"min_probability", "max_probability", "min_samples", "max_samples"},
+            nullable={"min_samples", "max_samples"},
+        )
+        limits[source_id] = _config.SourceLimit(
+            _number(limit["min_probability"], f"data.mixing.source_limits.{source_id}.min_probability"),
+            _number(limit["max_probability"], f"data.mixing.source_limits.{source_id}.max_probability"),
+            _nullable_integer(limit["min_samples"], f"data.mixing.source_limits.{source_id}.min_samples"),
+            _nullable_integer(limit["max_samples"], f"data.mixing.source_limits.{source_id}.max_samples"),
+        )
+    return _config.MixingConfig(
+        interpolation=_literal(payload["interpolation"], "data.mixing.interpolation", {"step", "linear"}),
+        schedule=tuple(schedule),
+        source_limits=limits,
+        source_failure_policy=_literal(
+            payload["source_failure_policy"], "data.mixing.source_failure_policy", {"fail", "degrade"}
+        ),
+        consecutive_failure_threshold=_integer(
+            payload["consecutive_failure_threshold"], "data.mixing.consecutive_failure_threshold"
+        ),
+    )
+
+
+def _build_diagnostics(value: Any, *, source_schema: int) -> _config.DistributedDiagnosticsConfig:
+    if value is None and source_schema == 1:
+        return _config.DistributedDiagnosticsConfig(
+            topology_check=False,
+            tensor_sizes_mib=(1.0,),
+            warmup_iterations=1,
+            measure_iterations=3,
+            straggler_ratio_threshold=1.5,
+            profile_start_step=None,
+            profile_num_steps=5,
+        )
+    fields = {
+        "topology_check",
+        "tensor_sizes_mib",
+        "warmup_iterations",
+        "measure_iterations",
+        "straggler_ratio_threshold",
+        "profile_start_step",
+        "profile_num_steps",
+    }
+    payload = _section(value, "distributed.diagnostics", fields, nullable={"profile_start_step"})
+    sizes = payload["tensor_sizes_mib"]
+    if not isinstance(sizes, list):
+        raise ConfigError("distributed.diagnostics.tensor_sizes_mib must be a list")
+    return _config.DistributedDiagnosticsConfig(
+        topology_check=_boolean(payload["topology_check"], "distributed.diagnostics.topology_check"),
+        tensor_sizes_mib=tuple(
+            _number(size, f"distributed.diagnostics.tensor_sizes_mib[{index}]") for index, size in enumerate(sizes)
+        ),
+        warmup_iterations=_integer(payload["warmup_iterations"], "distributed.diagnostics.warmup_iterations"),
+        measure_iterations=_integer(payload["measure_iterations"], "distributed.diagnostics.measure_iterations"),
+        straggler_ratio_threshold=_number(
+            payload["straggler_ratio_threshold"], "distributed.diagnostics.straggler_ratio_threshold"
+        ),
+        profile_start_step=_nullable_integer(
+            payload["profile_start_step"], "distributed.diagnostics.profile_start_step"
+        ),
+        profile_num_steps=_integer(payload["profile_num_steps"], "distributed.diagnostics.profile_num_steps"),
     )
 
 
@@ -479,6 +659,12 @@ def _nullable_number(value: Any, path: str) -> float | None:
 def _boolean(value: Any, path: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{path} must be a boolean")
+    return value
+
+
+def _literal(value: Any, path: str, choices: set[str]) -> str:
+    if not isinstance(value, str) or value not in choices:
+        raise ConfigError(f"{path} must be one of {sorted(choices)}")
     return value
 
 

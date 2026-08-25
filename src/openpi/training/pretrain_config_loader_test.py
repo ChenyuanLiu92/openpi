@@ -35,6 +35,33 @@ def test_complete_pi05_pretrain_template_is_valid():
     assert resolved.config.system_interval_seconds == 10
     assert resolved.config.runtime.compilation_cache.enabled is True
     assert resolved.config.runtime.fatal_cleanup_timeout_seconds == 15.0
+    assert resolved.config.micro_batch_size == 4
+    assert resolved.config.gradient_accumulation_steps == 8
+    assert resolved.config.data.pipeline.tokenizer_threads == 8
+    assert resolved.config.data_resume_mode == "exact"
+    assert resolved.config.distributed.diagnostics.tensor_sizes_mib == (1.0, 16.0, 64.0, 256.0)
+
+
+def test_schema_v1_is_migrated_with_compatible_defaults(tmp_path: pathlib.Path):
+    contents = yaml.safe_load(_template_path().read_text())
+    contents["schema_version"] = 1
+    del contents["data"]["pipeline"]
+    del contents["data"]["mixing"]
+    del contents["training"]["micro_batch_size"]
+    del contents["training"]["gradient_accumulation_steps"]
+    del contents["checkpoint"]["data_resume_mode"]
+    del contents["checkpoint"]["on_topology_change"]
+    del contents["distributed"]["diagnostics"]
+    path = tmp_path / "v1.yaml"
+    path.write_text(yaml.safe_dump(contents))
+
+    resolved = pretrain_config_loader.load(path)
+
+    assert resolved.config.micro_batch_size is None
+    assert resolved.config.gradient_accumulation_steps == 1
+    assert resolved.config.data.pipeline.host_prefetch_batches == 0
+    assert resolved.config.data_resume_mode == "statistical"
+    assert resolved.snapshot()["source_schema_version"] == 1
 
 
 def test_old_logging_section_receives_observability_defaults(tmp_path: pathlib.Path):
