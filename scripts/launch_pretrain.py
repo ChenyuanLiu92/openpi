@@ -30,12 +30,27 @@ _PRETRAIN_SCRIPT = _REPO_ROOT / "scripts" / "pretrain.py"
 _PROBE_SCRIPT = _REPO_ROOT / "scripts" / "check_gpu_collectives.py"
 _CGROUP_MEMORY_CURRENT = pathlib.Path("/sys/fs/cgroup/memory.current")
 _CGROUP_MEMORY_MAX = pathlib.Path("/sys/fs/cgroup/memory.max")
+_CGROUP_MEMORY_STAT = pathlib.Path("/sys/fs/cgroup/memory.stat")
 
 
 @dataclasses.dataclass(frozen=True)
 class RankSpec:
     process_id: int
     local_device_ids: tuple[int, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class CgroupMemory:
+    current: int
+    maximum: int
+    inactive_file: int | None
+
+    @property
+    def working_set(self) -> int:
+        return max(0, self.current - (self.inactive_file or 0))
+
+    def usage(self, accounting: str) -> int:
+        return self.working_set if accounting == "working-set" else self.current
 
 
 def _parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
@@ -65,6 +80,12 @@ def _parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
     local.add_argument("--shutdown-grace-seconds", type=float, default=15.0)
     local.add_argument("--min-memory-headroom-gib", type=float, default=0.0)
     local.add_argument("--wait-for-memory-seconds", type=float, default=0.0)
+    local.add_argument(
+        "--cgroup-memory-accounting",
+        choices=("working-set", "current"),
+        default="working-set",
+        help="Use reclaimable-cache-adjusted working set (default) or raw memory.current for memory guards.",
+    )
     local.add_argument(
         "--max-cgroup-memory-percent",
         type=float,
@@ -219,18 +240,38 @@ def _rank_command(
     return command
 
 
-def _read_cgroup_memory() -> tuple[int, int] | None:
+def _read_cgroup_memory() -> CgroupMemory | None:
     try:
         current = int(_CGROUP_MEMORY_CURRENT.read_text().strip())
         maximum_text = _CGROUP_MEMORY_MAX.read_text().strip()
         if maximum_text == "max":
             return None
-        return current, int(maximum_text)
+        maximum = int(maximum_text)
     except (OSError, ValueError):
         return None
+    try:
+        memory_stat = {
+            key: int(value)
+            for line in _CGROUP_MEMORY_STAT.read_text().splitlines()
+            for key, value in [line.split(maxsplit=1)]
+        }
+        inactive_file = memory_stat.get("inactive_file")
+    except (OSError, ValueError):
+        inactive_file = None
+    return CgroupMemory(current=current, maximum=maximum, inactive_file=inactive_file)
 
 
-def _wait_for_memory(minimum_headroom_gib: float, timeout_seconds: float) -> None:
+def _memory_description(memory: CgroupMemory, accounting: str) -> str:
+    inactive = "unavailable" if memory.inactive_file is None else f"{memory.inactive_file / 2**30:.1f} GiB"
+    used = memory.usage(accounting)
+    return (
+        f"accounting={accounting}, used={used / 2**30:.1f} GiB, raw_current={memory.current / 2**30:.1f} GiB, "
+        f"inactive_file={inactive}, limit={memory.maximum / 2**30:.1f} GiB, "
+        f"headroom={(memory.maximum - used) / 2**30:.1f} GiB"
+    )
+
+
+def _wait_for_memory(minimum_headroom_gib: float, timeout_seconds: float, *, accounting: str) -> None:
     if minimum_headroom_gib < 0 or timeout_seconds < 0:
         raise ValueError("Memory headroom and wait timeout must be non-negative")
     if minimum_headroom_gib == 0:
@@ -241,17 +282,19 @@ def _wait_for_memory(minimum_headroom_gib: float, timeout_seconds: float) -> Non
         memory = _read_cgroup_memory()
         if memory is None:
             raise RuntimeError("Cannot enforce memory headroom because this process has no finite cgroup v2 limit")
-        current, maximum = memory
-        headroom = maximum - current
+        if accounting == "working-set" and memory.inactive_file is None:
+            print("Cgroup memory.stat has no inactive_file; falling back to raw memory.current", flush=True)
+        headroom = memory.maximum - memory.usage(accounting)
         if headroom >= required:
             return
         if timeout_seconds == 0 or time.monotonic() >= deadline:
             raise RuntimeError(
                 f"Only {headroom / 2**30:.1f} GiB cgroup memory headroom is available; "
-                f"{minimum_headroom_gib:.1f} GiB is required"
+                f"{minimum_headroom_gib:.1f} GiB is required ({_memory_description(memory, accounting)})"
             )
         print(
-            f"Waiting for cgroup memory: {headroom / 2**30:.1f} GiB available, {minimum_headroom_gib:.1f} GiB required",
+            f"Waiting for cgroup memory: {minimum_headroom_gib:.1f} GiB required "
+            f"({_memory_description(memory, accounting)})",
             flush=True,
         )
         time.sleep(min(10.0, max(0.0, deadline - time.monotonic())))
@@ -297,7 +340,11 @@ def _run_local(args: argparse.Namespace) -> int:
         raise ValueError("shutdown-grace-seconds must be non-negative")
     if args.max_cgroup_memory_percent != 0 and not 0 < args.max_cgroup_memory_percent < 100:
         raise ValueError("max-cgroup-memory-percent must be 0 or between 0 and 100")
-    _wait_for_memory(args.min_memory_headroom_gib, args.wait_for_memory_seconds)
+    _wait_for_memory(
+        args.min_memory_headroom_gib,
+        args.wait_for_memory_seconds,
+        accounting=args.cgroup_memory_accounting,
+    )
 
     coordinator_address = args.coordinator_address or _free_loopback_address()
     _validate_address(coordinator_address)
@@ -372,22 +419,30 @@ def _run_local(args: argparse.Namespace) -> int:
             threads.append(thread)
 
         failure_code = 0
-        while any(process.poll() is None for process in processes):
-            failed = next(
-                (process.returncode for process in processes if process.returncode not in (None, 0)),
-                None,
-            )
+        while True:
+            # Poll every child before inspecting results. Using ``any(process.poll() ...)`` here would short-circuit
+            # after the first live rank and could leave a later failed rank unobserved indefinitely.
+            polled_return_codes = [process.poll() for process in processes]
+            failed = next((code for code in polled_return_codes if code not in (None, 0)), None)
             if failed is not None:
                 failure_code = failed
+                break
+            if all(code is not None for code in polled_return_codes):
                 break
             if stop_requested:
                 failure_code = 130
                 break
             if args.max_cgroup_memory_percent:
                 memory = _read_cgroup_memory()
-                if memory is not None and memory[0] / memory[1] * 100 >= args.max_cgroup_memory_percent:
+                if (
+                    memory is not None
+                    and memory.usage(args.cgroup_memory_accounting) / memory.maximum * 100
+                    >= args.max_cgroup_memory_percent
+                ):
                     print(
-                        f"Cgroup memory reached {memory[0] / memory[1] * 100:.1f}%; stopping launched ranks",
+                        f"Cgroup memory reached "
+                        f"{memory.usage(args.cgroup_memory_accounting) / memory.maximum * 100:.1f}%; "
+                        f"stopping launched ranks ({_memory_description(memory, args.cgroup_memory_accounting)})",
                         flush=True,
                     )
                     failure_code = 75

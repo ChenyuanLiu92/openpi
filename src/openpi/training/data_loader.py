@@ -424,6 +424,8 @@ class TorchDataLoader:
                 jax.sharding.PartitionSpec("B"),
             )
         self._num_batches = num_batches
+        self._epoch = 0
+        self._sampler = sampler
 
         mp_context = None
         if num_workers > 0:
@@ -449,9 +451,19 @@ class TorchDataLoader:
     def torch_loader(self) -> torch.utils.data.DataLoader:
         return self._data_loader
 
+    def __len__(self) -> int:
+        return len(self._data_loader)
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self._epoch = epoch
+
     def __iter__(self):
         num_items = 0
         while True:
+            if hasattr(self._sampler, "set_epoch"):
+                self._sampler.set_epoch(self._epoch)
             data_iter = iter(self._data_loader)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
@@ -466,6 +478,7 @@ class TorchDataLoader:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
+            self._epoch += 1
 
 
 def _collate_fn(items):
@@ -534,6 +547,14 @@ class DataLoaderImpl(DataLoader):
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    def __len__(self) -> int:
+        return len(self._data_loader)
+
+    def set_epoch(self, epoch: int) -> None:
+        if not hasattr(self._data_loader, "set_epoch"):
+            raise TypeError(f"{type(self._data_loader).__name__} does not support epoch control")
+        self._data_loader.set_epoch(epoch)
 
     def __iter__(self):
         for batch in self._data_loader:

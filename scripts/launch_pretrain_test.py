@@ -70,13 +70,16 @@ def test_local_dry_run_builds_two_ranks(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert len(payload["commands"]) == 2
 
 
-def test_local_launcher_stops_sibling_after_rank_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
+@pytest.mark.parametrize("failed_rank", [0, 1])
+def test_local_launcher_stops_sibling_after_rank_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, failed_rank: int
+):
     monkeypatch.setattr(launch_pretrain, "_available_gpu_ids", lambda: {0, 1})
     monkeypatch.setattr(launch_pretrain, "_free_loopback_address", lambda: "127.0.0.1:12345")
     monkeypatch.setattr(launch_pretrain, "_resolved_config", lambda *_: _config(tmp_path, batch_size=2, fsdp_devices=2))
 
     def command(**kwargs):
-        if kwargs["spec"].process_id == 0:
+        if kwargs["spec"].process_id == failed_rank:
             return [sys.executable, "-c", "raise SystemExit(7)"]
         return [sys.executable, "-c", "import time; time.sleep(30)"]
 
@@ -115,3 +118,37 @@ def test_launcher_validates_global_batch_and_fsdp(tmp_path: pathlib.Path):
         launch_pretrain._validate_launcher_config(  # noqa: SLF001
             _config(tmp_path, fsdp_devices=3), global_device_count=8
         )
+
+
+def test_cgroup_working_set_excludes_inactive_file(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
+    current = tmp_path / "memory.current"
+    maximum = tmp_path / "memory.max"
+    stat = tmp_path / "memory.stat"
+    current.write_text(str(170 * 2**30))
+    maximum.write_text(str(180 * 2**30))
+    stat.write_text(f"anon {120 * 2**30}\ninactive_file {50 * 2**30}\n")
+    monkeypatch.setattr(launch_pretrain, "_CGROUP_MEMORY_CURRENT", current)
+    monkeypatch.setattr(launch_pretrain, "_CGROUP_MEMORY_MAX", maximum)
+    monkeypatch.setattr(launch_pretrain, "_CGROUP_MEMORY_STAT", stat)
+
+    memory = launch_pretrain._read_cgroup_memory()  # noqa: SLF001
+
+    assert memory is not None
+    assert memory.working_set == 120 * 2**30
+    launch_pretrain._wait_for_memory(50, 0, accounting="working-set")  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="10.0 GiB"):
+        launch_pretrain._wait_for_memory(50, 0, accounting="current")  # noqa: SLF001
+
+
+def test_cgroup_working_set_falls_back_to_current(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys):
+    current = tmp_path / "memory.current"
+    maximum = tmp_path / "memory.max"
+    current.write_text(str(100 * 2**30))
+    maximum.write_text(str(180 * 2**30))
+    monkeypatch.setattr(launch_pretrain, "_CGROUP_MEMORY_CURRENT", current)
+    monkeypatch.setattr(launch_pretrain, "_CGROUP_MEMORY_MAX", maximum)
+    monkeypatch.setattr(launch_pretrain, "_CGROUP_MEMORY_STAT", tmp_path / "missing.stat")
+
+    launch_pretrain._wait_for_memory(50, 0, accounting="working-set")  # noqa: SLF001
+
+    assert "falling back to raw memory.current" in capsys.readouterr().out

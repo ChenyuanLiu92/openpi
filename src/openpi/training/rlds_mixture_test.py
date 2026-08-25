@@ -1,5 +1,7 @@
 import dataclasses
+import json
 import pathlib
+import types
 
 import numpy as np
 import pytest
@@ -41,3 +43,36 @@ def test_field_map_and_chunk_create_padding_masks():
     np.testing.assert_array_equal(batch["image_mask"]["right_wrist_0_rgb"].numpy(), [False, False])
     np.testing.assert_array_equal(batch["prompt"].numpy(), [b"move", b"move"])
     np.testing.assert_array_equal(batch["action_mask"].numpy().sum(axis=(1, 2)), [4, 2])
+
+
+def test_create_tfds_builder_loads_external_folder_dataset(tmp_path):
+    _, source = _small_config()
+    source = dataclasses.replace(source, data_dir=str(tmp_path), tfds_name="external", version="1.0.0")
+    external_dir = tmp_path / "external" / "1.0.0"
+    external_dir.mkdir(parents=True)
+    (external_dir / "dataset_info.json").write_text("{}")
+    (external_dir / "features.json").write_text("{}")
+    calls = []
+    fake_tfds = types.SimpleNamespace(
+        builder_from_directory=lambda path: calls.append(("folder", path)) or "external-builder",
+        builder=lambda *args, **kwargs: calls.append(("registered", args, kwargs)) or "registered-builder",
+    )
+
+    builder = rlds_mixture._create_tfds_builder(source, fake_tfds)  # noqa: SLF001
+
+    assert builder == "external-builder"
+    assert calls == [("folder", external_dir)]
+
+
+def test_build_lineage_inherits_conversion_lineage_id(tmp_path):
+    config, source = _small_config()
+    source = dataclasses.replace(source, data_dir=str(tmp_path), tfds_name="external", version="1.0.0")
+    config = dataclasses.replace(config, data=dataclasses.replace(config.data, sources=(source,)))
+    version_dir = tmp_path / "external" / "1.0.0"
+    version_dir.mkdir(parents=True)
+    (version_dir / "conversion_manifest.json").write_text(json.dumps({"lineage_id": "conversion-123"}))
+
+    lineage = rlds_mixture.build_lineage(config, {"config": "snapshot"})
+
+    assert lineage["lineage_id"] == "conversion-123"
+    assert lineage["datasets"][source.id]["conversion_lineage_id"] == "conversion-123"

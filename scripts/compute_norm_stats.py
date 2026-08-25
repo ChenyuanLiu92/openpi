@@ -21,6 +21,13 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
+def _norm_stats_output_path(train_config: _config.TrainConfig, data_config: _config.DataConfig):
+    asset_id = data_config.asset_id or data_config.repo_id
+    if asset_id is None:
+        raise ValueError("Data config must have an asset_id or repo_id")
+    return train_config.assets_dirs / asset_id
+
+
 def create_torch_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -119,7 +126,7 @@ def main(config: str | None = None, max_frames: int | None = None, config_name: 
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = train_config.assets_dirs / data_config.repo_id
+    output_path = _norm_stats_output_path(train_config, data_config)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

@@ -123,6 +123,7 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         "checkpoint",
         "logging",
         "distributed",
+        "runtime",
         "validation",
         "policy_metadata",
     }
@@ -140,8 +141,8 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
     initialization = _section(
         contents["initialization"], "initialization", {"type", "params_path"}, nullable={"params_path"}
     )
-    if initialization["type"] not in {"paligemma", "pi05_checkpoint"}:
-        raise ConfigError("initialization.type must be 'paligemma' or 'pi05_checkpoint'")
+    if initialization["type"] not in {"random", "paligemma", "pi05_checkpoint"}:
+        raise ConfigError("initialization.type must be 'random', 'paligemma', or 'pi05_checkpoint'")
 
     data_payload = dict(_mapping(contents["data"], "data"))
     data_fields = {
@@ -191,7 +192,28 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         {"exp_name", "save_interval", "keep_period", "overwrite", "resume"},
         nullable={"keep_period"},
     )
-    logging_config = _section(contents["logging"], "logging", {"project_name", "wandb_enabled", "log_interval"})
+    logging_required = {"project_name", "wandb_enabled", "log_interval"}
+    logging_defaults = {
+        "wandb_mode": "online",
+        "wandb_entity": None,
+        "local_root": None,
+        "tags": [],
+        "system_interval_seconds": 10,
+        "heartbeat_interval_seconds": 60,
+        "stall_timeout_seconds": 600,
+        "emergency_checkpoint_timeout_seconds": 120,
+        "webhook_url_env": "OPENPI_TRAIN_ALERT_WEBHOOK_URL",
+        "min_free_space_gib": 500,
+        "raw_retention_days": 90,
+    }
+    logging_config = dict(_mapping(contents["logging"], "logging"))
+    _check_keys(logging_config, logging_required | set(logging_defaults), logging_required, "logging")
+    logging_config = {**logging_defaults, **logging_config}
+    if logging_config["wandb_mode"] not in {"online", "offline", "disabled"}:
+        raise ConfigError("logging.wandb_mode must be online, offline, or disabled")
+    tags = logging_config["tags"]
+    if not isinstance(tags, list) or not all(isinstance(tag, str) and tag for tag in tags):
+        raise ConfigError("logging.tags must be a list of non-empty strings")
     distributed_required = {
         "fsdp_devices",
         "warmup_collectives",
@@ -211,6 +233,16 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         "distributed",
     )
     distributed = {"coordinator_bind_address": None, **distributed_payload}
+    runtime_payload = _section(
+        contents["runtime"],
+        "runtime",
+        {"compilation_cache", "fatal_cleanup_timeout_seconds"},
+    )
+    compilation_cache = _section(
+        runtime_payload["compilation_cache"],
+        "runtime.compilation_cache",
+        {"enabled", "directory", "minimum_compile_time_seconds", "explain_misses"},
+    )
     validation = _section(contents["validation"], "validation", {"interval_steps", "batches_per_source"})
     local_device_ids = distributed["local_device_ids"]
     if local_device_ids is not None:
@@ -245,6 +277,22 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         overwrite=_boolean(checkpoint["overwrite"], "checkpoint.overwrite"),
         resume=_boolean(checkpoint["resume"], "checkpoint.resume"),
         wandb_enabled=_boolean(logging_config["wandb_enabled"], "logging.wandb_enabled"),
+        wandb_mode=logging_config["wandb_mode"],
+        wandb_entity=_nullable_string(logging_config["wandb_entity"], "logging.wandb_entity"),
+        observability_local_root=_nullable_string(logging_config["local_root"], "logging.local_root"),
+        wandb_tags=tuple(tags),
+        system_interval_seconds=_integer(logging_config["system_interval_seconds"], "logging.system_interval_seconds"),
+        heartbeat_interval_seconds=_integer(
+            logging_config["heartbeat_interval_seconds"], "logging.heartbeat_interval_seconds"
+        ),
+        stall_timeout_seconds=_integer(logging_config["stall_timeout_seconds"], "logging.stall_timeout_seconds"),
+        emergency_checkpoint_timeout_seconds=_integer(
+            logging_config["emergency_checkpoint_timeout_seconds"],
+            "logging.emergency_checkpoint_timeout_seconds",
+        ),
+        webhook_url_env=_string(logging_config["webhook_url_env"], "logging.webhook_url_env"),
+        min_free_space_gib=_integer(logging_config["min_free_space_gib"], "logging.min_free_space_gib"),
+        raw_retention_days=_integer(logging_config["raw_retention_days"], "logging.raw_retention_days"),
         validation=_config.ValidationConfig(
             _integer(validation["interval_steps"], "validation.interval_steps"),
             _integer(validation["batches_per_source"], "validation.batches_per_source"),
@@ -265,6 +313,22 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
             ),
             initialization_timeout=_integer(
                 distributed["initialization_timeout"], "distributed.initialization_timeout"
+            ),
+        ),
+        runtime=_config.RuntimeConfig(
+            compilation_cache=_config.CompilationCacheConfig(
+                enabled=_boolean(compilation_cache["enabled"], "runtime.compilation_cache.enabled"),
+                directory=_string(compilation_cache["directory"], "runtime.compilation_cache.directory"),
+                minimum_compile_time_seconds=_number(
+                    compilation_cache["minimum_compile_time_seconds"],
+                    "runtime.compilation_cache.minimum_compile_time_seconds",
+                ),
+                explain_misses=_boolean(
+                    compilation_cache["explain_misses"], "runtime.compilation_cache.explain_misses"
+                ),
+            ),
+            fatal_cleanup_timeout_seconds=_number(
+                runtime_payload["fatal_cleanup_timeout_seconds"], "runtime.fatal_cleanup_timeout_seconds"
             ),
         ),
         policy_metadata=policy_metadata,

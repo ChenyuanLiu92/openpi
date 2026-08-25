@@ -1,4 +1,4 @@
-"""Run a reproducible two-rank pi0.5 pre-training smoke test with mock RLDS data."""
+"""Run a reproducible multi-rank pi0.5 pre-training smoke test with mock RLDS data."""
 
 from __future__ import annotations
 
@@ -30,7 +30,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-for-memory-seconds", type=float, default=0.0)
     parser.add_argument("--max-cgroup-memory-percent", type=float, default=95.0)
     parser.add_argument(
+        "--fsdp-devices",
+        type=int,
+        default=8,
+        help="Number of devices in the FSDP mesh axis; 1 selects pure data parallelism (default: 8).",
+    )
+    parser.add_argument(
         "--prepare-only", action="store_true", help="Generate and validate mock inputs without JAX ranks."
+    )
+    parser.add_argument(
+        "--dummy-model",
+        action="store_true",
+        help="Use dummy language/action variants for fast topology testing; the vision tower remains realistic.",
     )
     return parser.parse_args()
 
@@ -78,7 +89,9 @@ def _write_mock_rlds(data_dir: pathlib.Path, *, source_offset: float) -> tuple[s
                 return {"train": self._generate_examples()}
 
             def _generate_examples(self):
-                for episode_index in range(16):
+                # The validation quarter must contain at least one episode per simulated host. Thirty-two episodes
+                # keep the fixture valid for the supported 8-rank x 1-GPU topology.
+                for episode_index in range(32):
                     steps = []
                     for step_index in range(8):
                         value = self._source_offset + episode_index / 100.0 + step_index / 1000.0
@@ -138,9 +151,18 @@ def _source(source_id: str, tfds_name: str, version: str, data_dir: pathlib.Path
     }
 
 
-def _write_config(work_dir: pathlib.Path, sources: list[dict[str, Any]]) -> pathlib.Path:
+def _write_config(
+    work_dir: pathlib.Path,
+    sources: list[dict[str, Any]],
+    *,
+    dummy_model: bool,
+    fsdp_devices: int,
+) -> pathlib.Path:
     contents = yaml.safe_load(_TEMPLATE.read_text())
     contents["name"] = "pi05_multinode_smoke"
+    contents["initialization"] = {"type": "random", "params_path": None}
+    if dummy_model:
+        contents["model"].update({"paligemma_variant": "dummy", "action_expert_variant": "dummy"})
     contents["data"].update(
         {
             "temperature": 1.0,
@@ -157,7 +179,7 @@ def _write_config(work_dir: pathlib.Path, sources: list[dict[str, Any]]) -> path
         "checkpoint_base_dir": str(work_dir / "checkpoints"),
     }
     contents["checkpoint"].update(
-        {"exp_name": "two-rank-full-model", "save_interval": 1, "keep_period": None, "overwrite": True, "resume": False}
+        {"exp_name": "multi-rank-smoke", "save_interval": 1, "keep_period": None, "overwrite": True, "resume": False}
     )
     contents["logging"] = {
         "project_name": "openpi-multinode-smoke",
@@ -166,7 +188,7 @@ def _write_config(work_dir: pathlib.Path, sources: list[dict[str, Any]]) -> path
     }
     contents["distributed"].update(
         {
-            "fsdp_devices": 8,
+            "fsdp_devices": fsdp_devices,
             "warmup_collectives": True,
             "initialize": False,
             "coordinator_address": None,
@@ -178,6 +200,7 @@ def _write_config(work_dir: pathlib.Path, sources: list[dict[str, Any]]) -> path
         }
     )
     contents["validation"] = {"interval_steps": 1, "batches_per_source": 1}
+    contents["runtime"]["compilation_cache"]["directory"] = str(work_dir / "jax-cache")
     config_path = work_dir / "smoke.yaml"
     config_path.write_text(yaml.safe_dump(contents, sort_keys=False, allow_unicode=True))
     return config_path
@@ -229,23 +252,24 @@ def _assert_checkpoint(config_path: pathlib.Path, expected_step: int, expected_e
         raise RuntimeError(f"Checkpoint {expected_step} consumed {consumed} examples; expected {expected_examples}")
 
 
-def _assert_rank_logs(log_dir: pathlib.Path, *, probe: bool) -> None:
+def _assert_rank_logs(log_dir: pathlib.Path, *, probe: bool, expected_ranks: int) -> None:
     logs = sorted(log_dir.glob("rank-*.log"))
-    if len(logs) != 2:
-        raise RuntimeError(f"Expected two rank logs in {log_dir}; found {logs}")
+    if len(logs) != expected_ranks:
+        raise RuntimeError(f"Expected {expected_ranks} rank logs in {log_dir}; found {logs}")
     combined = "\n".join(path.read_text() for path in logs)
     if probe:
-        if combined.count("Global collective check passed") < 2:
-            raise RuntimeError("Both ranks did not report a passing global collective probe")
-    elif "process 0/2" not in combined or "process 1/2" not in combined:
-        raise RuntimeError("Training logs do not contain both JAX process identities")
+        if combined.count("Global collective check passed") < expected_ranks:
+            raise RuntimeError("Not all ranks reported a passing global collective probe")
+    elif any(f"process {rank}/{expected_ranks}" not in combined for rank in range(expected_ranks)):
+        raise RuntimeError("Training logs do not contain every JAX process identity")
 
 
 def _assert_finite_metrics(log_dir: pathlib.Path) -> None:
-    pattern = re.compile(r"train/loss=([^, ]+).*train/grad_norm=([^, ]+)")
+    pattern = re.compile(r"train/(?P<name>loss|grad_norm)=(?P<value>[^, ]+)")
     for path in log_dir.glob("rank-*.log"):
-        for match in pattern.finditer(path.read_text()):
-            if math.isfinite(float(match.group(1))) and math.isfinite(float(match.group(2))):
+        for line in path.read_text().splitlines():
+            values = {match.group("name"): float(match.group("value")) for match in pattern.finditer(line)}
+            if values.keys() >= {"loss", "grad_norm"} and all(math.isfinite(value) for value in values.values()):
                 return
     raise RuntimeError("No finite train/loss and train/grad_norm pair was recorded")
 
@@ -264,17 +288,20 @@ def main() -> None:
             _source("mock_a", name_a, version_a, source_a_root, 1.0),
             _source("mock_b", name_b, version_b, source_b_root, 3.0),
         ],
+        dummy_model=args.dummy_model,
+        fsdp_devices=args.fsdp_devices,
     )
     _write_norm_stats(config_path)
     if args.prepare_only:
         print(f"Prepared mock RLDS smoke inputs: {config_path}")
         return
 
+    expected_ranks = len(args.device_group or ["0,1,2,3", "4,5,6,7"])
     probe_command = [*_launcher_command(args, config_path, work_dir / "logs-probe"), "--probe-only"]
     subprocess.run(probe_command, cwd=_REPO_ROOT, check=True)
-    _assert_rank_logs(work_dir / "logs-probe", probe=True)
+    _assert_rank_logs(work_dir / "logs-probe", probe=True, expected_ranks=expected_ranks)
     subprocess.run(_launcher_command(args, config_path, work_dir / "logs-step-1"), cwd=_REPO_ROOT, check=True)
-    _assert_rank_logs(work_dir / "logs-step-1", probe=False)
+    _assert_rank_logs(work_dir / "logs-step-1", probe=False, expected_ranks=expected_ranks)
     _assert_checkpoint(config_path, expected_step=1, expected_examples=8)
     _assert_finite_metrics(work_dir / "logs-step-1")
 
@@ -283,10 +310,11 @@ def main() -> None:
     contents["checkpoint"].update({"overwrite": False, "resume": True})
     config_path.write_text(yaml.safe_dump(contents, sort_keys=False, allow_unicode=True))
     subprocess.run(_launcher_command(args, config_path, work_dir / "logs-step-2"), cwd=_REPO_ROOT, check=True)
-    _assert_rank_logs(work_dir / "logs-step-2", probe=False)
+    _assert_rank_logs(work_dir / "logs-step-2", probe=False, expected_ranks=expected_ranks)
     _assert_checkpoint(config_path, expected_step=2, expected_examples=16)
     _assert_finite_metrics(work_dir / "logs-step-2")
-    print(f"Full-model multi-rank smoke test passed: {work_dir}")
+    model_label = "dummy-model" if args.dummy_model else "full-model"
+    print(f"{model_label} multi-rank smoke test passed: {work_dir}")
 
 
 if __name__ == "__main__":

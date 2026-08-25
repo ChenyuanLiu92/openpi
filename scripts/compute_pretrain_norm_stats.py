@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 
 import jax
 import numpy as np
 import tyro
 
 from openpi.shared import normalize
+from openpi.training import observability
 from openpi.training import pretrain_config
 from openpi.training import pretrain_config_loader
 from openpi.training import rlds_mixture
+
+_ACTIVE_OBSERVERS: list[observability.RunObserver] = []
 
 
 def _allocate_samples(probabilities: list[float], total: int) -> list[int]:
@@ -40,6 +44,7 @@ def _group_sources(
 
 def main(
     config_path: str,
+    /,
     *,
     max_frames_per_normalization: int = 1_000_000,
     batch_size: int = 1024,
@@ -55,7 +60,24 @@ def main(
     if max_frames_per_normalization <= 0 or batch_size <= 0:
         raise ValueError("Frame budget and batch size must be positive")
 
-    config = pretrain_config_loader.load(config_path).config
+    resolved = pretrain_config_loader.load(config_path)
+    config = resolved.config
+    snapshot = resolved.snapshot()
+    lineage = rlds_mixture.build_lineage(config, snapshot)
+    observer = observability.RunObserver(
+        observability.options_from_pretrain_config(
+            config,
+            job_type="normalization",
+            experiment=f"{config.exp_name}-normalization",
+        ),
+        manifest=snapshot,
+        lineage=lineage,
+    )
+    _ACTIVE_OBSERVERS.append(observer)
+    observer.log_artifact_metadata("normalization-inputs", lineage, artifact_type="normalization-lineage")
+    started = time.monotonic()
+    total_processed = 0
+    observer.set_phase("normalization")
     for normalization_id, weighted_sources in _group_sources(config).items():
         sources = [source for source, _ in weighted_sources]
         probabilities = [probability for _, probability in weighted_sources]
@@ -77,7 +99,7 @@ def main(
             )
             dataset = dataset.take(target).batch(batch_size, drop_remainder=False)
             source_frames = 0
-            for batch in dataset.as_numpy_iterator():
+            for batch_index, batch in enumerate(dataset.as_numpy_iterator(), start=1):
                 states = np.asarray(batch["state"], dtype=np.float32)
                 actions = np.asarray(batch["actions"], dtype=np.float32)
                 if not np.all(np.isfinite(states)) or not np.all(np.isfinite(actions)):
@@ -85,6 +107,18 @@ def main(
                 state_stats.update(states)
                 action_stats.update(actions)
                 source_frames += len(states)
+                total_processed += len(states)
+                if batch_index % 100 == 0:
+                    elapsed = max(time.monotonic() - started, 1e-6)
+                    observer.mark_progress(total_processed)
+                    observer.log_metrics(
+                        {
+                            "normalization/frames": total_processed,
+                            "normalization/frames_per_second": total_processed / elapsed,
+                            f"normalization/source/{source.id}/frames": source_frames,
+                        },
+                        step=total_processed,
+                    )
             if source_frames < target:
                 logging.warning(
                     "Source %s provided %d frames, below its requested budget of %d",
@@ -105,7 +139,29 @@ def main(
             sample_count=total_frames,
         )
         logging.info("Saved %d-frame normalization statistics to %s", total_frames, output)
+        manifest_path = output / "stats_manifest.json"
+        metadata = {
+            "normalization_id": normalization_id,
+            "sample_count": total_frames,
+            "uri": str(output),
+            "manifest_sha256": observability.file_digest(manifest_path),
+        }
+        observer.log_metrics(
+            {f"normalization/{normalization_id}/frames": total_frames},
+            step=total_processed,
+        )
+        observer.log_artifact_metadata(
+            f"normalization-{normalization_id}", metadata, artifact_type="normalization-reference"
+        )
+    observer.finish(status="completed")
+    _ACTIVE_OBSERVERS.clear()
 
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    try:
+        tyro.cli(main)
+    except BaseException as exc:
+        if _ACTIVE_OBSERVERS:
+            _ACTIVE_OBSERVERS[-1].alert("uncaught_exception", f"{type(exc).__name__}: {exc}", deduplicate_seconds=0)
+            _ACTIVE_OBSERVERS[-1].finish(status="failed", error=f"{type(exc).__name__}: {exc}")
+        raise

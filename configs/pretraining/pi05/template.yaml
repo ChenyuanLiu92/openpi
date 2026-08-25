@@ -63,11 +63,12 @@ model:
 
 # 初始化方式的全部字段。
 initialization:
+  # random：全部参数由 seed 随机初始化，不访问网络，适合从零预训练和离线 smoke test。
   # paligemma：只加载官方 PaliGemma 参数，其余 π0.5 参数随机初始化。
   # pi05_checkpoint：加载一个完整 π0.5 params checkpoint，可用于继续预训练/二阶段训练。
   type: paligemma
 
-  # type=paligemma 时必须为 null；type=pi05_checkpoint 时必须填写本地或 gs:// params 路径，
+  # type=random/paligemma 时必须为 null；type=pi05_checkpoint 时必须填写本地或 gs:// params 路径，
   # 例如 gs://openpi-assets/checkpoints/pi05_base/params。
   params_path: null
 
@@ -243,8 +244,54 @@ logging:
   # 是否启用 W&B；false 时仍输出本地 tqdm/log。
   wandb_enabled: true
 
+  # online 写入 W&B Cloud；offline 仅生成可由 wandb sync 上传的本地记录；disabled 完全关闭。
+  wandb_mode: online
+
+  # 可选 W&B entity/team；null 使用当前登录账号的默认 entity。
+  wandb_entity: null
+
+  # PFS 观测日志根目录；null 默认写到 <checkpoint_dir>/observability。
+  local_root: null
+
+  # W&B run tags。
+  tags: [pi05, rlds, pretraining]
+
   # 多少 optimizer step 聚合并记录一次训练指标。
   log_interval: 100
+
+  # CPU/GPU/PFS 指标采样与 heartbeat 周期。
+  system_interval_seconds: 10
+  heartbeat_interval_seconds: 60
+
+  # training phase 内多久没有 optimizer step 判定为 stall。
+  stall_timeout_seconds: 600
+  emergency_checkpoint_timeout_seconds: 120
+
+  # Webhook URL 只从该环境变量读取，绝不进入配置快照。
+  webhook_url_env: OPENPI_TRAIN_ALERT_WEBHOOK_URL
+
+  # PFS 剩余空间阈值与高频原始系统日志保留天数。
+  min_free_space_gib: 500
+  raw_retention_days: 90
+
+# JAX 进程运行时配置。JAX_* 同名环境变量可在不修改 YAML 的情况下临时覆盖缓存字段。
+runtime:
+  compilation_cache:
+    # 是否启用 JAX 持久编译缓存。
+    enabled: true
+
+    # 缓存目录。单机可使用本地盘；真实多节点要让所有 rank 复用缓存时必须指向共享 PFS。
+    directory: ~/.cache/jax
+
+    # 只缓存编译耗时达到该阈值的 executable，单位秒；0 表示缓存所有条目。
+    minimum_compile_time_seconds: 1.0
+
+    # true 时输出持久缓存 miss 原因，建议只在调试时打开。
+    explain_misses: false
+
+  # 未捕获异常后用于刷新 observer/W&B/log 并关闭 JAX distributed runtime 的最长时间。
+  # 超时后进程会硬退出，确保 launcher 能回收其他 rank。
+  fatal_cleanup_timeout_seconds: 15.0
 
 # 原生 JAX 单机/多机配置的全部字段。
 distributed:

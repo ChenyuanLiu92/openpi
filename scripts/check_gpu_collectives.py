@@ -77,7 +77,9 @@ def main() -> None:
     result = gpu_collectives.run_local_fsdp_collective_probe(
         devices=devices,
         repetitions=args.repetitions,
-        require_multiple_devices=True,
+        # A one-device rank has no meaningful local collective, but a multi-process job still has a global
+        # collective to validate. Keep rejecting a single-process/single-device invocation because it tests neither.
+        require_multiple_devices=jax.process_count() == 1,
     )
     logging.info(
         "Collective check passed: devices=%d, expected_sum=%.1f, timings=%s",

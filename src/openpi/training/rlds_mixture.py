@@ -19,6 +19,7 @@ import numpy as np
 from openpi.models import model as _model
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import normalize
+from openpi.training import observability
 from openpi.training import pretrain_config
 from openpi.training import rlds_adapters
 
@@ -39,6 +40,49 @@ def source_fingerprint(source: pretrain_config.RldsSourceConfig) -> str:
     payload = dataclasses.asdict(source)
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def build_lineage(config: pretrain_config.PretrainConfig, snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Build stable data lineage shared by normalization and training jobs."""
+    datasets = {}
+    source_lineage_ids = []
+    for source in config.data.sources:
+        manifest_path = pathlib.Path(source.data_dir) / source.tfds_name / source.version / "conversion_manifest.json"
+        conversion_lineage_id = None
+        if manifest_path.is_file():
+            try:
+                conversion_lineage_id = json.loads(manifest_path.read_text()).get("lineage_id")
+            except (json.JSONDecodeError, OSError):
+                conversion_lineage_id = None
+        if conversion_lineage_id:
+            source_lineage_ids.append(str(conversion_lineage_id))
+        datasets[source.id] = {
+            "tfds_name": source.tfds_name,
+            "version": source.version,
+            "uri": str(manifest_path.parent),
+            "source_config_sha256": source_fingerprint(source),
+            "manifest_sha256": observability.file_digest(manifest_path) if manifest_path.is_file() else None,
+            "conversion_lineage_id": conversion_lineage_id,
+        }
+    identity = {"schema_version": 1, "datasets": datasets}
+    normalizations = {}
+    for source in config.data.sources:
+        path = config.assets_dirs / source.normalization_id / _STATS_MANIFEST
+        normalizations[source.normalization_id] = {
+            "uri": str(path.parent),
+            "manifest_sha256": observability.file_digest(path) if path.is_file() else None,
+        }
+    lineage_id = (
+        source_lineage_ids[0]
+        if len(datasets) == 1 and len(source_lineage_ids) == 1
+        else observability.stable_digest(identity)[:16]
+    )
+    return {
+        **identity,
+        "lineage_id": lineage_id,
+        "normalizations": normalizations,
+        "config_sha256": observability.stable_digest(snapshot) if snapshot is not None else None,
+    }
 
 
 def expected_stats_manifest(
@@ -291,7 +335,7 @@ def _create_source_dataset(
             raise RuntimeError("TensorFlow initialized a GPU before the RLDS loader could disable it") from exc
     parallel_reads = _autotune(config.data.num_parallel_reads, tf)
     parallel_calls = _autotune(config.data.num_parallel_calls, tf)
-    builder = tfds.builder(source.tfds_name, data_dir=source.data_dir, version=source.version)
+    builder = _create_tfds_builder(source, tfds)
     available_splits = set(builder.info.splits)
     split_name = split.split("[")[0]
     if split_name not in available_splits:
@@ -327,6 +371,14 @@ def _create_source_dataset(
     options = tf.data.Options()
     options.deterministic = not (training or statistics_only)
     return dataset.with_options(options)
+
+
+def _create_tfds_builder(source: pretrain_config.RldsSourceConfig, tfds: Any) -> Any:
+    """Load registered TFDS builders or externally generated folder datasets."""
+    external_dir = pathlib.Path(source.data_dir) / source.tfds_name / source.version
+    if (external_dir / "dataset_info.json").is_file() and (external_dir / "features.json").is_file():
+        return tfds.builder_from_directory(external_dir)
+    return tfds.builder(source.tfds_name, data_dir=source.data_dir, version=source.version)
 
 
 def _chunk_and_prepare(

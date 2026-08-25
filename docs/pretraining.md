@@ -1,6 +1,6 @@
 # π0.5 大规模 RLDS 预训练
 
-本仓库的预训练入口用于在多个机器人 RLDS/TFDS 数据源上从 PaliGemma 初始化或已有 π0.5 checkpoint
+本仓库的预训练入口用于在多个机器人 RLDS/TFDS 数据源上随机初始化、从 PaliGemma 初始化，或从已有 π0.5 checkpoint
 继续训练 flow-matching VLA。它与 `scripts/train.py` 的微调配置和数据管线相互独立，不需要修改
 `src/openpi/training/config.py`。
 
@@ -39,6 +39,12 @@ p_i = weight_i^(1 / temperature) / sum_j(weight_j^(1 / temperature))
 
 如果声明式字段拼接不足以表示某个数据集，应在 `openpi.training.rlds_adapters` 注册一个经过代码审查的 adapter，
 然后只在 YAML 中引用注册名。YAML 不允许 Python import 或任意 callable。
+
+AgiBotWorld Beta 的 tar 流式转换、断点续传和生产运行方式见
+[`agibotworld_beta_conversion.md`](agibotworld_beta_conversion.md)。转换器生成的是 external folder dataset，loader 会在
+`<data_dir>/<tfds_name>/<version>` 检测 `dataset_info.json` 并通过 `builder_from_directory` 加载，不需要注册 Python TFDS builder。
+ABC-130K 的 MCAP 流式转换见 [`abc130k_conversion.md`](abc130k_conversion.md)，输出遵循同一个 external folder dataset
+约定，并保留原始 train/val 为 TFDS train/validation split。
 
 ## 环境与归一化统计
 
@@ -95,13 +101,71 @@ sm_120 GPU 上可通过 AllReduce，却会在 AllGather 触发 `CUDA_ERROR_ILLEG
 
 初始化方式由 YAML 决定：
 
+- `random`：使用 `training.seed` 随机初始化全部参数，不访问 GCS，适合从零预训练和离线 smoke test。
 - `paligemma`：加载 PaliGemma 参数，其余 π0.5 参数随机初始化。
 - `pi05_checkpoint`：加载完整的 π0.5 params，可做二阶段或继续预训练。
+
+`runtime.compilation_cache` 控制 JAX 持久编译缓存。代码会在 distributed 初始化和任何 JAX 运算前应用这些配置，并分别记录
+`performance/train_compile_seconds` 和训练 step 耗时。同一拓扑、模型 shape、JAX/jaxlib 版本及 XLA flags 不变时，后续运行应复用
+缓存；`4×2`、`2×4`、`1×8` 的 executable 不同，首次切换拓扑仍会发生一次冷编译。首次从 checkpoint 恢复时也可能因
+输入 state 的 committed sharding 与随机初始化路径不同而生成一个额外 cache key，之后相同恢复拓扑会复用该 key。真实多节点上
+JAX 只让 global rank 0 写缓存，因此若所有节点都要在后续作业中命中，`runtime.compilation_cache.directory` 必须指向共享 PFS。
+调试 miss 时可临时设置：
+
+```bash
+JAX_EXPLAIN_CACHE_MISSES=true JAX_LOG_COMPILES=true \
+uv run --group rlds scripts/pretrain.py <config.yaml>
+```
 
 验证按 source 独立读取 `validation_split`，记录每个 source 的 loss、source macro loss 和按训练概率加权的 mixture loss。
 checkpoint 精确保存和恢复模型参数、optimizer、EMA 与 step，同时保存完整 YAML manifest、CLI override、Git revision、
 所有 normalization assets 和各 source 已消费样本数。RLDS shuffle/prefetch 流采用统计恢复：resume 后使用由 step 派生的新 seed，
 不会逐条重放中断前的数据顺序。
+
+## 全周期日志、W&B 与告警
+
+预训练、RLDS 转换和 normalization stats 使用同一套 lineage。转换 manifest 中的 `lineage_id` 会被统计任务和训练任务继承；
+W&B 中分别显示为 `data_conversion`、`normalization` 和 `training` job。大体积 RLDS 与 checkpoint 始终保留在 BOS/PFS，
+W&B Artifact 只保存配置、manifest、统计摘要以及对应 URI 和 SHA-256，不会重复上传模型或数据。
+
+训练默认写入 W&B Cloud，同时将完整记录写入：
+
+```text
+<logging.local_root>/<project>/<experiment>/<run_id>/
+├── run_manifest.json       # 配置、代码版本、host/process 信息
+├── lineage.json            # dataset/normalization revision
+├── metrics.jsonl           # loss、吞吐、数据源和 checkpoint 指标
+├── events.jsonl            # 初始化、编译、训练、验证和退出状态
+├── alerts.jsonl
+├── logs/process-*.log
+└── system/process-*.jsonl  # 每日或 512 MiB 轮转
+```
+
+`logging.local_root: null` 时目录位于 `<checkpoint_dir>/observability`。W&B 初始化或网络发送失败只会降级到 PFS 日志，
+不会终止健康训练；`wandb_mode: offline` 可主动只落本地，之后运行 `wandb sync <run目录>/wandb`。
+resume 会沿用 checkpoint 根目录中的 `wandb_id.txt`，因此 W&B run、PFS run 目录和 global step 都保持连续。
+
+可选通用 Webhook 通过环境变量提供，URL 不会进入 YAML snapshot：
+
+```bash
+export OPENPI_TRAIN_ALERT_WEBHOOK_URL='https://example.internal/openpi-alert'
+```
+
+NaN/Inf、checkpoint 失败、未捕获异常、终止信号、PFS 空间不足，以及 training phase 600 秒没有 optimizer step
+都会写入 PFS 并发送 W&B/Webhook 告警。JAX 首次编译、验证和 checkpoint 有独立 phase，不会误报 stall。致命异常会在当前
+安全边界尝试 emergency checkpoint；超过配置的 grace period 后以非零状态退出。
+
+高频系统日志可以交给定时任务归档；最近 5 分钟仍有写入的文件会自动跳过，`archive` 只压缩，`prune` 仅在 `.zst`
+校验成功后删除超过保留期的原始 JSONL：
+
+```bash
+uv run scripts/manage_observability.py \
+  --root /mnt/pfs/path/to/observability --action archive
+uv run scripts/manage_observability.py \
+  --root /mnt/pfs/path/to/observability --action prune --raw-retention-days 90
+```
+
+训练指标、事件、告警、manifest 和压缩后的系统日志不会由训练进程自动删除。
 
 ## 单机与原生 JAX 多机
 
@@ -117,6 +181,8 @@ uv run --group rlds scripts/launch_pretrain.py local \
 
 先加 `--probe-only` 可以只运行本地和跨 rank 的 AllReduce、AllGather、ReduceScatter 数值检查，不加载 RLDS 或模型。
 launcher 自动选择 loopback coordinator 端口、为每个 rank 保存独立日志，并在任一 rank 失败时回收自己启动的其他 rank。
+训练 rank 遇到未捕获异常时会先落盘 traceback 和 observer 状态，再尝试关闭日志与 JAX distributed runtime；超过
+`runtime.fatal_cleanup_timeout_seconds` 后硬退出，避免一个已失败 rank 卡住其余进程。
 训练参数仍可放在 `--` 后临时覆盖；`--distributed.*` 参数由 launcher 独占，不能通过 passthrough 重复设置：
 
 ```bash
@@ -174,5 +240,13 @@ uv run --group rlds scripts/multinode_pretrain_smoke.py \
   --wait-for-memory-seconds 3600
 ```
 
-默认要求 cgroup 至少有 140 GiB 可用主存，并在使用率达到 95% 时只停止本次启动的 rank。smoke test 不会删除或复用已有目录，
-也不会终止机器上的其他进程。
+只验证 launcher、数据、FSDP 和 checkpoint 的多进程拓扑时可加 `--dummy-model`，它缩小语言与 action expert，保留真实视觉
+输入和相同训练控制流；正式模型显存/主存验收不要使用该选项。
+
+单机 8 卡也可以用 8 个单卡 rank 模拟 `8 节点 × 1 GPU`，为命令增加八组
+`--device-group 0 --device-group 1 ... --device-group 7`。这种方式会执行真实的 8-rank JAX/NCCL 协调，但通信仍走本机
+SHM/P2P，不能用于推断真实节点间 IB/RoCE 性能。
+
+默认要求 cgroup 至少有 140 GiB 可用主存，并在使用率达到 95% 时只停止本次启动的 rank。内存保护默认使用
+`memory.current - memory.stat:inactive_file` 得到 working set，不会把可回收 file cache 当成不可用内存；需要保守复现原始
+口径时可给 launcher 传 `--cgroup-memory-accounting current`。smoke test 不会删除或复用已有目录，也不会终止机器上的其他进程。

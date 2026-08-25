@@ -67,10 +67,12 @@ class RldsMixtureConfig:
 class InitializationConfig:
     """How the pi0.5 parameter tree is initialized."""
 
-    type: Literal["paligemma", "pi05_checkpoint"]
+    type: Literal["random", "paligemma", "pi05_checkpoint"]
     params_path: str | None
 
     def create_weight_loader(self) -> weight_loaders.WeightLoader:
+        if self.type == "random":
+            return weight_loaders.NoOpWeightLoader()
         if self.type == "paligemma":
             return weight_loaders.PaliGemmaWeightLoader()
         assert self.params_path is not None
@@ -100,6 +102,24 @@ class DistributedConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class CompilationCacheConfig:
+    """Persistent JAX compilation-cache settings."""
+
+    enabled: bool
+    directory: str
+    minimum_compile_time_seconds: float
+    explain_misses: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeConfig:
+    """Process runtime and fatal-cleanup behavior."""
+
+    compilation_cache: CompilationCacheConfig
+    fatal_cleanup_timeout_seconds: float
+
+
+@dataclasses.dataclass(frozen=True)
 class PretrainConfig:
     """Complete pi0.5 pre-training configuration."""
 
@@ -123,8 +143,20 @@ class PretrainConfig:
     overwrite: bool
     resume: bool
     wandb_enabled: bool
+    wandb_mode: Literal["online", "offline", "disabled"]
+    wandb_entity: str | None
+    observability_local_root: str | None
+    wandb_tags: tuple[str, ...]
+    system_interval_seconds: int
+    heartbeat_interval_seconds: int
+    stall_timeout_seconds: int
+    emergency_checkpoint_timeout_seconds: int
+    webhook_url_env: str
+    min_free_space_gib: int
+    raw_retention_days: int
     validation: ValidationConfig
     distributed: DistributedConfig
+    runtime: RuntimeConfig
     policy_metadata: dict[str, Any] | None = None
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
@@ -139,8 +171,8 @@ class PretrainConfig:
             raise ValueError("Pre-training currently supports pi0.5 only; model.pi05 must be true")
         if "lora" in self.model.paligemma_variant or "lora" in self.model.action_expert_variant:
             raise ValueError("LoRA variants are not supported by the pi0.5 pre-training entrypoint")
-        if self.initialization.type == "paligemma" and self.initialization.params_path is not None:
-            raise ValueError("initialization.params_path must be null for paligemma initialization")
+        if self.initialization.type in {"random", "paligemma"} and self.initialization.params_path is not None:
+            raise ValueError(f"initialization.params_path must be null for {self.initialization.type} initialization")
         if self.initialization.type == "pi05_checkpoint" and not self.initialization.params_path:
             raise ValueError("initialization.params_path is required for pi05_checkpoint initialization")
         if not math.isfinite(self.data.temperature) or self.data.temperature <= 0:
@@ -222,12 +254,39 @@ class PretrainConfig:
             raise ValueError("Invalid SGD optimizer parameters")
         if self.log_interval <= 0 or self.save_interval <= 0:
             raise ValueError("log_interval and save_interval must be positive")
+        if self.wandb_mode not in {"online", "offline", "disabled"}:
+            raise ValueError("wandb_mode must be online, offline, or disabled")
+        for field_name, value in {
+            "system_interval_seconds": self.system_interval_seconds,
+            "heartbeat_interval_seconds": self.heartbeat_interval_seconds,
+            "stall_timeout_seconds": self.stall_timeout_seconds,
+            "emergency_checkpoint_timeout_seconds": self.emergency_checkpoint_timeout_seconds,
+            "raw_retention_days": self.raw_retention_days,
+        }.items():
+            if value <= 0:
+                raise ValueError(f"{field_name} must be positive")
+        if self.min_free_space_gib < 0:
+            raise ValueError("min_free_space_gib must be non-negative")
+        if not self.webhook_url_env:
+            raise ValueError("webhook_url_env must be non-empty")
         if self.keep_period is not None and self.keep_period <= 0:
             raise ValueError("keep_period must be positive or null")
         if self.validation.interval_steps <= 0 or self.validation.batches_per_source <= 0:
             raise ValueError("validation intervals and batch counts must be positive")
         if self.distributed.fsdp_devices <= 0 or self.distributed.initialization_timeout <= 0:
             raise ValueError("distributed device counts and timeout must be positive")
+        if not self.runtime.compilation_cache.directory:
+            raise ValueError("runtime.compilation_cache.directory must be non-empty")
+        if (
+            not math.isfinite(self.runtime.compilation_cache.minimum_compile_time_seconds)
+            or self.runtime.compilation_cache.minimum_compile_time_seconds < 0
+        ):
+            raise ValueError("runtime.compilation_cache.minimum_compile_time_seconds must be finite and non-negative")
+        if (
+            not math.isfinite(self.runtime.fatal_cleanup_timeout_seconds)
+            or self.runtime.fatal_cleanup_timeout_seconds <= 0
+        ):
+            raise ValueError("runtime.fatal_cleanup_timeout_seconds must be finite and positive")
         if self.distributed.num_processes is not None and self.distributed.num_processes <= 0:
             raise ValueError("distributed.num_processes must be positive or null")
         if self.distributed.process_id is not None and self.distributed.process_id < 0:
@@ -289,6 +348,12 @@ class PretrainConfig:
     @property
     def checkpoint_dir(self) -> pathlib.Path:
         return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+
+    @property
+    def observability_root(self) -> pathlib.Path:
+        if self.observability_local_root is not None:
+            return pathlib.Path(self.observability_local_root).expanduser().resolve()
+        return self.checkpoint_dir / "observability"
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:

@@ -9,6 +9,7 @@ from openpi.shared import normalize
 from openpi.training import pretrain_config_loader
 from openpi.training import rlds_adapters
 from openpi.training import rlds_mixture
+from openpi.training import weight_loaders
 
 
 def _template_path() -> pathlib.Path:
@@ -30,6 +31,27 @@ def test_complete_pi05_pretrain_template_is_valid():
     assert rlds_adapters.registered_adapters() == ("field_map",)
     adapter = rlds_adapters.create_adapter(resolved.config.data.sources[0])
     assert isinstance(adapter, rlds_adapters.FieldMapAdapter)
+    assert resolved.config.wandb_mode == "online"
+    assert resolved.config.system_interval_seconds == 10
+    assert resolved.config.runtime.compilation_cache.enabled is True
+    assert resolved.config.runtime.fatal_cleanup_timeout_seconds == 15.0
+
+
+def test_old_logging_section_receives_observability_defaults(tmp_path: pathlib.Path):
+    contents = yaml.safe_load(_template_path().read_text())
+    contents["logging"] = {
+        "project_name": "legacy-project",
+        "wandb_enabled": False,
+        "log_interval": 20,
+    }
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(contents))
+
+    config = pretrain_config_loader.load(path).config
+
+    assert config.wandb_mode == "online"
+    assert config.observability_local_root is None
+    assert config.stall_timeout_seconds == 600
 
 
 def test_pretrain_config_supports_cli_overrides():
@@ -43,6 +65,7 @@ def test_pretrain_config_supports_cli_overrides():
             "--data.temperature",
             "2.0",
             "--distributed.no-warmup-collectives",
+            "--runtime.compilation-cache.explain-misses",
         ]
     )
 
@@ -50,7 +73,29 @@ def test_pretrain_config_supports_cli_overrides():
     assert resolved.config.batch_size == 8
     assert resolved.config.data.temperature == 2.0
     assert resolved.config.distributed.warmup_collectives is False
+    assert resolved.config.runtime.compilation_cache.explain_misses is True
     assert resolved.manifest["checkpoint"]["exp_name"] == "baseline"
+
+
+def test_pretrain_config_supports_random_initialization(tmp_path: pathlib.Path):
+    contents = yaml.safe_load(_template_path().read_text())
+    contents["initialization"] = {"type": "random", "params_path": None}
+    path = tmp_path / "random.yaml"
+    path.write_text(yaml.safe_dump(contents))
+
+    config = pretrain_config_loader.load(path).config
+
+    assert isinstance(config.weight_loader, weight_loaders.NoOpWeightLoader)
+
+
+def test_random_initialization_rejects_params_path(tmp_path: pathlib.Path):
+    contents = yaml.safe_load(_template_path().read_text())
+    contents["initialization"] = {"type": "random", "params_path": "/tmp/params"}
+    path = tmp_path / "invalid-random.yaml"
+    path.write_text(yaml.safe_dump(contents))
+
+    with pytest.raises(pretrain_config_loader.ConfigError, match="must be null for random"):
+        pretrain_config_loader.load(path)
 
 
 def test_pretrain_config_validates_explicit_distributed_topology():

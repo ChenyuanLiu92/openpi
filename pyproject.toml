@@ -59,7 +59,11 @@ rlds = [
     # DLimP pins tensorflow==2.15.0, which only supports Python 3.11 in this project.
     # Do not also install tensorflow-cpu: both distributions own the same Python
     # package and shared libraries, and installing them together corrupts the env.
+    "av>=14.0.0",
     "dlimp",
+    "h5py>=3.10.0",
+    "mcap>=1.2.2",
+    "mcap-protobuf-support>=0.5.3",
     "tensorflow-datasets==4.9.9",
 ]
 
