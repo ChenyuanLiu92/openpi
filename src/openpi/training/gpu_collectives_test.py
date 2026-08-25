@@ -124,3 +124,16 @@ def test_cuda_cache_warnings(monkeypatch: pytest.MonkeyPatch, caplog: pytest.Log
     assert "disables the driver JIT cache" in caplog.text
     assert "is not writable" in caplog.text
     assert "message after 10 seconds is a progress warning" in caplog.text
+
+
+def test_collective_baseline_detects_regression(tmp_path: pathlib.Path):
+    baseline = gpu_collectives.CollectiveBandwidthResult("all_reduce", 16.0, 0.1, 0.1, 10.0, 10.0, 1.0)
+    current = gpu_collectives.CollectiveBandwidthResult("all_reduce", 16.0, 0.2, 0.2, 4.0, 4.0, 1.0)
+    path = tmp_path / "baseline.json"
+    gpu_collectives.write_collective_baseline(path, (baseline,))
+
+    with pytest.raises(RuntimeError, match="Collective bandwidth regression"):
+        gpu_collectives.validate_collective_baseline(path, (current,), minimum_fraction=0.8, policy="fail")
+
+    regressions = gpu_collectives.validate_collective_baseline(path, (current,), minimum_fraction=0.8, policy="warn")
+    assert len(regressions) == 1

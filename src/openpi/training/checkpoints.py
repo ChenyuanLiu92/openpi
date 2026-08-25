@@ -6,6 +6,7 @@ import concurrent.futures as futures
 import dataclasses
 import json
 import logging
+import shutil
 from typing import Any, Protocol
 
 from etils import epath
@@ -46,6 +47,7 @@ def initialize_checkpoint_dir(
         item_handlers={
             "assets": CallbackHandler(),
             "metadata": CallbackHandler(),
+            "data_iterator": CallbackHandler(all_processes=True),
             "train_state": ocp.PyTreeCheckpointHandler(),
             "params": ocp.PyTreeCheckpointHandler(),
         },
@@ -76,6 +78,7 @@ def save_state(
     config_snapshot: dict | None = None,
     extra_assets: Mapping[str, dict[str, _normalize.NormStats]] | None = None,
     extra_metadata: Mapping[str, Any] | None = None,
+    iterator_snapshot_dir: epath.Path | str | None = None,
 ):
     def save_assets(directory: epath.Path):
         if data_loader is not None:
@@ -95,6 +98,17 @@ def save_state(
                 json.dumps(dict(extra_metadata), indent=2, sort_keys=True) + "\n"
             )
 
+    def save_iterator(directory: epath.Path):
+        assert iterator_snapshot_dir is not None
+        source = epath.Path(iterator_snapshot_dir)
+        target = directory / f"rank-{jax.process_index():05d}"
+        target.mkdir(parents=True, exist_ok=False)
+        for path in source.iterdir():
+            if path.is_dir():
+                shutil.copytree(str(path), str(target / path.name))
+            else:
+                shutil.copy2(str(path), str(target / path.name))
+
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
@@ -104,6 +118,8 @@ def save_state(
         "train_state": train_state,
         "params": {"params": params},
     }
+    if iterator_snapshot_dir is not None:
+        items["data_iterator"] = save_iterator
     checkpoint_manager.save(step, items)
 
 
@@ -156,8 +172,11 @@ class Callback(Protocol):
 class CallbackHandler(ocp.AsyncCheckpointHandler):
     """A CheckpointHandler for calling an arbitrary function asynchronously. Only for saving, not for restoring."""
 
+    def __init__(self, *, all_processes: bool = False):
+        self._all_processes = all_processes
+
     def save(self, directory: epath.Path, args: CallbackSave):
-        if jax.process_index() == 0:
+        if self._all_processes or jax.process_index() == 0:
             args.callback(directory)
 
     async def async_save(self, directory: epath.Path, args: CallbackSave) -> list[futures.Future]:

@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 import dataclasses
 import importlib.metadata
+import json
 import logging
 import os
 import pathlib
+import subprocess
 import time
+from typing import Any, Literal
 
 import jax
 from jax.experimental import multihost_utils
@@ -47,7 +50,7 @@ class CollectiveBandwidthResult:
     rank_straggler_ratio: float
 
 
-def log_topology_diagnostics() -> dict[str, str]:
+def log_topology_diagnostics() -> dict[str, Any]:
     """Log GPU/NIC visibility and flag invalid explicit NCCL interface bindings."""
     interfaces = sorted(path.name for path in pathlib.Path("/sys/class/net").glob("*") if path.name != "lo")
     binding = os.environ.get("NCCL_SOCKET_IFNAME")
@@ -57,6 +60,18 @@ def log_topology_diagnostics() -> dict[str, str]:
         "nccl_socket_ifname": binding or "<auto>",
         "nccl_ib_hca": os.environ.get("NCCL_IB_HCA", "<auto>"),
         "nccl_cross_nic": os.environ.get("NCCL_CROSS_NIC", "<default>"),
+        "interfaces": {
+            name: {
+                "operstate": _read_sysfs(pathlib.Path("/sys/class/net") / name / "operstate"),
+                "mtu": _read_sysfs(pathlib.Path("/sys/class/net") / name / "mtu"),
+                "speed_mbps": _read_sysfs(pathlib.Path("/sys/class/net") / name / "speed"),
+                "numa_node": _read_sysfs(pathlib.Path("/sys/class/net") / name / "device" / "numa_node"),
+            }
+            for name in interfaces
+        },
+        "gpu_topology": _run_optional_command(("nvidia-smi", "topo", "-m")),
+        "rdma_devices": _run_optional_command(("ibdev2netdev",)),
+        "rdma_links": _run_optional_command(("ibstat", "-l")),
     }
     logging.info("Communication topology: %s", status)
     if binding:
@@ -68,6 +83,67 @@ def log_topology_diagnostics() -> dict[str, str]:
                 "fix the launcher NIC binding before training"
             )
     return status
+
+
+def write_collective_baseline(
+    path: str | pathlib.Path,
+    results: Sequence[CollectiveBandwidthResult],
+    *,
+    topology: dict[str, Any] | None = None,
+) -> None:
+    """Write a portable, versioned startup-bandwidth baseline on process zero."""
+    if jax.process_index() == 0:
+        output = pathlib.Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "process_count": jax.process_count(),
+            "global_device_count": jax.device_count(),
+            "topology": topology,
+            "results": [dataclasses.asdict(result) for result in results],
+        }
+        output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices("collective_baseline_written")
+
+
+def validate_collective_baseline(
+    path: str | pathlib.Path,
+    results: Sequence[CollectiveBandwidthResult],
+    *,
+    minimum_fraction: float,
+    policy: Literal["warn", "fail"],
+) -> tuple[str, ...]:
+    """Compare measured algorithm bandwidth to a stored machine baseline."""
+    baseline_path = pathlib.Path(path)
+    if not baseline_path.is_file():
+        raise FileNotFoundError(f"Collective baseline does not exist: {baseline_path}")
+    payload = json.loads(baseline_path.read_text())
+    if payload.get("schema_version") != 1:
+        raise ValueError(f"Unsupported collective baseline schema: {payload.get('schema_version')!r}")
+    expected = {
+        (item["operation"], round(float(item["payload_mib"]), 6)): float(item["algorithm_gib_per_second"])
+        for item in payload["results"]
+    }
+    regressions = []
+    for result in results:
+        key = (result.operation, round(result.payload_mib, 6))
+        if key not in expected:
+            regressions.append(f"missing baseline entry for {result.operation}/{result.payload_mib:g} MiB")
+            continue
+        threshold = expected[key] * minimum_fraction
+        if result.algorithm_gib_per_second < threshold:
+            regressions.append(
+                f"{result.operation}/{result.payload_mib:g} MiB bandwidth "
+                f"{result.algorithm_gib_per_second:.3f} GiB/s is below {minimum_fraction:.0%} of "
+                f"baseline {expected[key]:.3f} GiB/s"
+            )
+    if regressions:
+        message = "Collective bandwidth regression: " + "; ".join(regressions)
+        if policy == "fail":
+            raise RuntimeError(message)
+        logging.warning(message)
+    return tuple(regressions)
 
 
 def benchmark_global_collectives(
@@ -487,6 +563,22 @@ def _path_is_writable(path: pathlib.Path) -> bool:
     while not candidate.exists() and candidate != candidate.parent:
         candidate = candidate.parent
     return candidate.is_dir() and os.access(candidate, os.W_OK)
+
+
+def _read_sysfs(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def _run_optional_command(command: tuple[str, ...]) -> str | None:
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    output = result.stdout.strip() or result.stderr.strip()
+    return output[-16000:] if output else None
 
 
 def _package_version(name: str) -> str:

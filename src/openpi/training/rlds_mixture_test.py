@@ -136,6 +136,39 @@ def test_loader_prefetches_batch_tokenization_and_reshapes_microbatches(monkeypa
     assert loader.metrics()["consumed_batches"] == 1
 
 
+def test_exact_iterator_snapshot_restores_next_batch_without_replay(monkeypatch, tmp_path):
+    config, _ = _small_config()
+    config = dataclasses.replace(config, batch_size=1, micro_batch_size=1, gradient_accumulation_steps=1)
+    monkeypatch.setattr(rlds_mixture._tokenizer, "PaligemmaTokenizer", _FakeTokenizer)  # noqa: SLF001
+    batches = [_numpy_batch(1, config.model.action_dim, config.model.action_horizon) for _ in range(3)]
+    for index, batch in enumerate(batches):
+        batch["state"].fill(index)
+
+    def stack(values):
+        first = values[0]
+        if isinstance(first, dict):
+            return {key: stack([value[key] for value in values]) for key in first}
+        return np.stack(values)
+
+    dataset = tf.data.Dataset.from_tensor_slices(stack(batches))
+    loader = rlds_mixture.RldsMixtureDataLoader(config, dataset, sharding=None)
+    iterator = iter(loader)
+    next(iterator)
+    snapshot = tmp_path / "rank-00000"
+    loader.snapshot_iterator(snapshot)
+    expected = next(iterator)
+
+    restored = rlds_mixture.RldsMixtureDataLoader(
+        config,
+        tf.data.Dataset.from_tensor_slices(stack(batches)),
+        sharding=None,
+        iterator_state_dir=snapshot,
+    )
+    actual = next(iter(restored))
+
+    np.testing.assert_array_equal(actual.observation.state, expected.observation.state)
+
+
 def test_dynamic_weight_stream_changes_at_optimizer_step():
     config, source = _small_config()
     second = dataclasses.replace(source, id="second", weight=1.0)
@@ -203,3 +236,37 @@ def test_global_sample_limit_is_partitioned_across_ranks(monkeypatch):
 
     # Seven samples remain globally: rank quotas are [3, 2, 2].
     assert rlds_mixture._local_remaining_quota(12, 5) == 2  # noqa: SLF001
+
+
+def test_minimum_sample_quota_forces_source_before_run_ends():
+    config, source = _small_config()
+    second = dataclasses.replace(source, id="second", weight=99.0)
+    limits = {source.id: pretrain_config.SourceLimit(0.0, 1.0, 1, None)}
+    mixing = dataclasses.replace(config.data.mixing, source_limits=limits)
+    config = dataclasses.replace(
+        config,
+        num_train_steps=2,
+        data=dataclasses.replace(config.data, sources=(dataclasses.replace(source, weight=1.0), second), mixing=mixing),
+    )
+    runtime = rlds_mixture._MixtureRuntime(config, None)  # noqa: SLF001
+    values = rlds_mixture._dynamic_weight_dataset(  # noqa: SLF001
+        config, local_batch_size=1, start_step=1, tf=tf, mixture_runtime=runtime
+    )
+
+    np.testing.assert_allclose(next(iter(values.as_numpy_iterator())), [1.0, 0.0], atol=1e-6)
+
+
+def test_source_with_unmet_minimum_cannot_degrade():
+    config, source = _small_config()
+    second = dataclasses.replace(source, id="second")
+    mixing = dataclasses.replace(
+        config.data.mixing,
+        source_limits={source.id: pretrain_config.SourceLimit(0.0, 1.0, 1, None)},
+        source_failure_policy="degrade",
+        consecutive_failure_threshold=1,
+    )
+    config = dataclasses.replace(config, data=dataclasses.replace(config.data, sources=(source, second), mixing=mixing))
+    runtime = rlds_mixture._MixtureRuntime(config, None)  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="Cannot degrade source"):
+        runtime.record_failure(np.asarray([0], dtype=np.int32))

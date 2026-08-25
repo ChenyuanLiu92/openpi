@@ -13,6 +13,7 @@ import functools
 import logging
 import os
 import platform
+import shutil
 import signal
 import sys
 import threading
@@ -267,6 +268,13 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
             warmup_iterations=diagnostics.warmup_iterations,
             measure_iterations=diagnostics.measure_iterations,
         )
+        if diagnostics.collective_baseline_path is not None:
+            gpu_collectives.validate_collective_baseline(
+                diagnostics.collective_baseline_path,
+                collective_benchmarks,
+                minimum_fraction=diagnostics.minimum_baseline_fraction,
+                policy=diagnostics.bandwidth_regression_policy,
+            )
     # The leading axis is the replicated accumulation dimension; DATA_AXIS shards each microbatch.
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
@@ -348,18 +356,40 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
         }
         if config.data_resume_mode == "exact" and previous_topology != current_topology:
             message = f"Exact data resume topology mismatch: checkpoint={previous_topology}, current={current_topology}"
-            if config.on_topology_change == "error":
+            if not config.cluster.allow_topology_change or config.on_topology_change == "error":
                 raise ValueError(message)
             logging.warning("%s; explicitly falling back to statistical data resume", message)
             config = dataclasses.replace(config, data_resume_mode="statistical")
         initial_counts = previous_data_state.get("consumed_examples_per_source")
         if not isinstance(initial_counts, dict) or set(initial_counts) != set(config.source_indices):
             raise ValueError("Checkpoint data source IDs do not match the current pretraining config")
+    iterator_state_dir = None
+    if resuming and config.data_resume_mode == "exact":
+        latest_step = checkpoint_manager.latest_step()
+        candidate = config.checkpoint_dir / str(latest_step) / "data_iterator" / f"rank-{jax.process_index():05d}"
+        local_available = np.asarray([int(candidate.exists())], dtype=np.int32)
+        availability = (
+            np.asarray(multihost_utils.process_allgather(local_available)).reshape(-1)
+            if jax.process_count() > 1
+            else local_available
+        )
+        if not np.all(availability):
+            message = (
+                f"Exact resume requires one iterator sidecar per process at step {latest_step}; "
+                f"availability={availability.tolist()}"
+            )
+            if config.on_missing_iterator_state == "error":
+                raise FileNotFoundError(message)
+            logging.warning("%s; explicitly falling back to statistical data resume", message)
+            config = dataclasses.replace(config, data_resume_mode="statistical")
+        else:
+            iterator_state_dir = candidate
     train_loader = rlds_mixture.create_train_loader(
         config,
         sharding=data_sharding,
         start_step=start_step,
         initial_counts=initial_counts,
+        iterator_state_dir=iterator_state_dir,
     )
     train_iterator = iter(train_loader)
     validation_loaders = rlds_mixture.create_validation_loaders(config, sharding=data_sharding)
@@ -514,6 +544,29 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
             observer.set_phase("checkpoint", step=completed_step)
             checkpoint_started = time.monotonic()
             try:
+                iterator_snapshot_dir = None
+                if config.data_resume_mode == "exact":
+                    iterator_snapshot_dir = (
+                        config.checkpoint_dir
+                        / ".iterator_staging"
+                        / str(completed_step)
+                        / f"rank-{jax.process_index():05d}"
+                    )
+                    if iterator_snapshot_dir.exists():
+                        shutil.rmtree(iterator_snapshot_dir)
+                    snapshot_started = time.monotonic()
+                    train_loader.snapshot_iterator(iterator_snapshot_dir)
+                    snapshot_seconds = time.monotonic() - snapshot_started
+                    if snapshot_seconds > config.iterator_snapshot_timeout_seconds:
+                        raise TimeoutError(
+                            f"Iterator snapshot took {snapshot_seconds:.1f}s, exceeding "
+                            f"checkpoint.iterator_snapshot_timeout_seconds={config.iterator_snapshot_timeout_seconds}"
+                        )
+                    observer.log_metrics(
+                        {"checkpoint/iterator_snapshot_seconds": snapshot_seconds}, step=completed_step
+                    )
+                    if jax.process_count() > 1:
+                        multihost_utils.sync_global_devices(f"iterator_snapshot_{completed_step}_ready")
                 checkpoints.save_state(
                     checkpoint_manager,
                     state,
@@ -522,6 +575,7 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
                     config_snapshot=snapshot,
                     extra_assets=train_loader.all_norm_stats(),
                     extra_metadata=train_loader.data_state(),
+                    iterator_snapshot_dir=iterator_snapshot_dir,
                 )
             except BaseException as exc:
                 observer.alert("checkpoint_failed", f"Checkpoint enqueue failed: {type(exc).__name__}: {exc}")
@@ -578,6 +632,14 @@ def main(resolved: pretrain_config_loader.ResolvedPretrainConfig) -> None:
         "lineage_id": observer.lineage_id,
     }
     observer.log_artifact_metadata("checkpoint-index", checkpoint_pointer, artifact_type="checkpoint-reference")
+    train_loader.close()
+    for loader in validation_loaders.values():
+        loader.close()
+    staging_root = config.checkpoint_dir / ".iterator_staging"
+    if jax.process_index() == 0 and staging_root.exists():
+        shutil.rmtree(staging_root)
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices("iterator_staging_cleaned")
     observer.finish(status="stopped" if observer.stop_requested else "completed")
     _ACTIVE_OBSERVERS.clear()
 

@@ -31,6 +31,10 @@ from openpi.training import rlds_adapters
 _STATS_MANIFEST = "stats_manifest.json"
 
 
+def _tensor_to_numpy(value: Any) -> np.ndarray:
+    return np.asarray(value.numpy() if hasattr(value, "numpy") else value)
+
+
 class _MixtureRuntime:
     """Thread-safe source health shared by the host converter and tf.data sampler."""
 
@@ -40,6 +44,11 @@ class _MixtureRuntime:
         self._active = np.ones(len(config.data.sources), dtype=bool)
         self._failures = np.zeros(len(config.data.sources), dtype=np.int64)
         self._active_variable: Any | None = None
+        self._counts_variable: Any | None = None
+        self._initial_counts = np.asarray(
+            [int((initial_counts or {}).get(source.id, 0)) for source in config.data.sources], dtype=np.int64
+        )
+        self._session_counts = np.zeros(len(config.data.sources), dtype=np.int64)
         for index, source in enumerate(config.data.sources):
             limit = config.data.mixing.source_limits.get(source.id)
             if limit is not None and limit.max_samples is not None:
@@ -56,7 +65,23 @@ class _MixtureRuntime:
     def attach_tensorflow(self, tf: Any) -> Any:
         with self._lock:
             self._active_variable = tf.Variable(self._active, trainable=False, dtype=tf.bool)
+            self._counts_variable = tf.Variable(self._session_counts, trainable=False, dtype=tf.int64)
             return self._active_variable
+
+    @property
+    def counts_variable(self) -> Any | None:
+        return self._counts_variable
+
+    def local_minimum_targets(self) -> np.ndarray:
+        return np.asarray(
+            [
+                0
+                if (limit := self._config.data.mixing.source_limits.get(source.id)) is None or limit.min_samples is None
+                else _local_remaining_quota(limit.min_samples, int(self._initial_counts[index]))
+                for index, source in enumerate(self._config.data.sources)
+            ],
+            dtype=np.int64,
+        )
 
     def record_success(self, source_ids: np.ndarray) -> None:
         with self._lock:
@@ -70,6 +95,15 @@ class _MixtureRuntime:
             for index in np.unique(source_ids):
                 self._failures[index] += 1
                 if self._failures[index] >= self._config.data.mixing.consecutive_failure_threshold:
+                    limit = self._config.data.mixing.source_limits.get(self._config.data.sources[index].id)
+                    if limit is not None and limit.min_samples is not None:
+                        local_minimum = _local_remaining_quota(limit.min_samples, int(self._initial_counts[index]))
+                        if self._session_counts[index] < local_minimum:
+                            raise RuntimeError(
+                                f"Cannot degrade source {self._config.data.sources[index].id!r}: "
+                                f"its min_samples quota still needs {local_minimum - self._session_counts[index]} "
+                                "examples on this rank"
+                            )
                     self._active[index] = False
                     degraded.append(self._config.data.sources[index].id)
             if not self._active.any():
@@ -82,6 +116,7 @@ class _MixtureRuntime:
         changed = False
         with self._lock:
             for index, source in enumerate(self._config.data.sources):
+                self._session_counts[index] = session_counts[source.id]
                 limit = self._config.data.mixing.source_limits.get(source.id)
                 if (
                     limit is not None
@@ -93,10 +128,32 @@ class _MixtureRuntime:
                     self._active[index] = False
             if changed and self._active_variable is not None:
                 self._active_variable.assign(self._active)
+            if self._counts_variable is not None:
+                self._counts_variable.assign(self._session_counts)
 
     def snapshot(self) -> tuple[np.ndarray, np.ndarray]:
         with self._lock:
             return self._active.copy(), self._failures.copy()
+
+    def state_dict(self) -> dict[str, list[int] | list[bool]]:
+        active, failures = self.snapshot()
+        return {"active": active.tolist(), "consecutive_failures": failures.tolist()}
+
+    def restore(self, state: Mapping[str, Any]) -> None:
+        active = np.asarray(state["active"], dtype=bool)
+        failures = np.asarray(state["consecutive_failures"], dtype=np.int64)
+        expected = (len(self._config.data.sources),)
+        if active.shape != expected or failures.shape != expected:
+            raise ValueError(
+                f"Invalid mixture runtime state shapes: {active.shape}, {failures.shape}; expected {expected}"
+            )
+        if not active.any():
+            raise ValueError("Cannot restore a mixture runtime with no active source")
+        with self._lock:
+            self._active = active
+            self._failures = failures
+            if self._active_variable is not None:
+                self._active_variable.assign(self._active)
 
 
 def _local_remaining_quota(global_limit: int, globally_consumed: int) -> int:
@@ -237,6 +294,7 @@ class RldsMixtureDataLoader:
         initial_counts: Mapping[str, int] | None = None,
         initial_batches: int = 0,
         mixture_runtime: _MixtureRuntime | None = None,
+        iterator_state_dir: pathlib.Path | None = None,
     ):
         self._config = config
         self._dataset = dataset
@@ -256,6 +314,11 @@ class RldsMixtureDataLoader:
             "host_queue_depth": 0.0,
             "device_queue_depth": 0.0,
             "host_queue_wait_seconds": 0.0,
+            "tfds_fetch_seconds": 0.0,
+            "tfds_read_errors": 0.0,
+            "tfds_read_retries": 0.0,
+            "device_submit_seconds": 0.0,
+            "host_to_device_block_seconds": 0.0,
             **{f"source/{source.id}/tokenizer_seconds": 0.0 for source in config.data.sources},
         }
         self._recent_bad = deque(maxlen=config.data.pipeline.bad_sample_window)
@@ -264,13 +327,27 @@ class RldsMixtureDataLoader:
         self._repeated_examples = 0
         self._processed_examples = 0
         self._mixture_runtime = mixture_runtime
+        try:
+            self._tf_iterator = iter(dataset)
+        except TypeError:
+            # Lightweight unit-test datasets and compatible third-party wrappers may only expose the NumPy protocol.
+            self._tf_iterator = dataset.as_numpy_iterator()
+        self._worker: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._closed = False
+        if iterator_state_dir is not None:
+            self.restore_iterator(iterator_state_dir)
 
     def __iter__(self) -> Iterator[PretrainBatch]:
-        batches = self._dataset.as_numpy_iterator()
+        if self._closed:
+            raise RuntimeError("Cannot iterate a closed RLDS loader")
+        batches = self._iter_numpy_batches()
         if self._num_batches is not None:
             batches = itertools.islice(batches, self._num_batches)
         host_batches = self._host_prefetch(batches)
-        depth = self._config.data.pipeline.device_prefetch_batches
+        # An asynchronous Python/device queue advances beyond the batch handed to the trainer and is not represented in
+        # a tf.data iterator checkpoint. Exact mode therefore relies only on tf.data's own checkpointable prefetch.
+        depth = 0 if self._config.data_resume_mode == "exact" else self._config.data.pipeline.device_prefetch_batches
         if depth <= 0:
             for batch in host_batches:
                 self._mark_consumed(batch)
@@ -290,8 +367,32 @@ class RldsMixtureDataLoader:
             self._mark_consumed(host_batch)
             yield ready
 
+    def _iter_numpy_batches(self) -> Iterator[Any]:
+        retries = self._config.data.pipeline.source_max_retries
+        delay = self._config.data.pipeline.source_retry_initial_seconds
+        maximum_delay = self._config.data.pipeline.source_retry_max_seconds
+        while not self._stop_event.is_set():
+            attempt = 0
+            while True:
+                started = time.monotonic()
+                try:
+                    batch = next(self._tf_iterator)
+                    self._add_metric("tfds_fetch_seconds", time.monotonic() - started)
+                    yield jax.tree.map(_tensor_to_numpy, batch)
+                    break
+                except StopIteration:
+                    return
+                except Exception:
+                    self._add_metric("tfds_read_errors", 1)
+                    if attempt >= retries:
+                        raise
+                    self._add_metric("tfds_read_retries", 1)
+                    if delay:
+                        time.sleep(min(delay * (2**attempt), maximum_delay))
+                    attempt += 1
+
     def _host_prefetch(self, batches: Iterator[Any]) -> Iterator[PretrainBatch]:
-        depth = self._config.data.pipeline.host_prefetch_batches
+        depth = 0 if self._config.data_resume_mode == "exact" else self._config.data.pipeline.host_prefetch_batches
         if depth <= 0:
             for batch in batches:
                 converted = self._convert_or_handle(batch)
@@ -302,30 +403,45 @@ class RldsMixtureDataLoader:
         output: queue.Queue[Any] = queue.Queue(maxsize=depth)
         sentinel = object()
 
+        def put(item: Any) -> bool:
+            while not self._stop_event.is_set():
+                try:
+                    output.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
         def produce() -> None:
             try:
                 for batch in batches:
+                    if self._stop_event.is_set():
+                        break
                     converted = self._convert_or_handle(batch)
                     if converted is not None:
-                        output.put(converted)
+                        if not put(converted):
+                            break
                         self._set_metric("host_queue_depth", output.qsize())
             except BaseException as exc:  # propagate worker exceptions on the training thread
-                output.put(exc)
+                put(exc)
             finally:
-                output.put(sentinel)
+                put(sentinel)
 
-        worker = threading.Thread(target=produce, name="rlds-host-prefetch", daemon=True)
-        worker.start()
-        while True:
-            started = time.monotonic()
-            item = output.get()
-            self._add_metric("host_queue_wait_seconds", time.monotonic() - started)
-            self._set_metric("host_queue_depth", output.qsize())
-            if item is sentinel:
-                return
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+        self._worker = threading.Thread(target=produce, name="rlds-host-prefetch", daemon=True)
+        self._worker.start()
+        try:
+            while True:
+                started = time.monotonic()
+                item = output.get()
+                self._add_metric("host_queue_wait_seconds", time.monotonic() - started)
+                self._set_metric("host_queue_depth", output.qsize())
+                if item is sentinel:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            self._stop_event.set()
 
     def _convert_or_handle(self, batch: Mapping[str, Any]) -> PretrainBatch | None:
         try:
@@ -432,7 +548,61 @@ class RldsMixtureDataLoader:
     def _to_device(self, batch: PretrainBatch) -> PretrainBatch:
         if self._sharding is None:
             return batch
-        return jax.tree.map(lambda value: jax.make_array_from_process_local_data(self._sharding, value), batch)
+        started = time.monotonic()
+        result = jax.tree.map(lambda value: jax.make_array_from_process_local_data(self._sharding, value), batch)
+        self._add_metric("device_submit_seconds", time.monotonic() - started)
+        if (self._base_batches + self._session_batches) % self._config.data.pipeline.metrics_sample_interval_steps == 0:
+            started = time.monotonic()
+            jax.block_until_ready(result)
+            self._add_metric("host_to_device_block_seconds", time.monotonic() - started)
+        return result
+
+    def snapshot_iterator(self, directory: pathlib.Path) -> None:
+        """Save this rank's tf.data cursor and source-health state into ``directory``."""
+        if self._config.data_resume_mode != "exact":
+            raise RuntimeError("Iterator snapshots are only valid in exact data resume mode")
+        import tensorflow as tf
+
+        directory.mkdir(parents=True, exist_ok=False)
+        prefix = str(directory / "iterator")
+        tf.train.Checkpoint(iterator=self._tf_iterator).write(prefix)
+        runtime_state = {
+            "schema_version": 1,
+            "process_index": jax.process_index(),
+            "process_count": jax.process_count(),
+            "mixture_runtime": None if self._mixture_runtime is None else self._mixture_runtime.state_dict(),
+        }
+        (directory / "runtime_state.json").write_text(json.dumps(runtime_state, indent=2, sort_keys=True) + "\n")
+
+    def restore_iterator(self, directory: pathlib.Path) -> None:
+        """Restore this rank's tf.data cursor before the first input batch is requested."""
+        import tensorflow as tf
+
+        runtime_path = directory / "runtime_state.json"
+        index_path = directory / "iterator.index"
+        if not runtime_path.is_file() or not index_path.is_file():
+            raise FileNotFoundError(f"Incomplete iterator checkpoint for rank {jax.process_index()}: {directory}")
+        state = json.loads(runtime_path.read_text())
+        if state.get("process_index") != jax.process_index() or state.get("process_count") != jax.process_count():
+            raise ValueError(f"Iterator checkpoint topology/rank mismatch: {state}")
+        status = tf.train.Checkpoint(iterator=self._tf_iterator).restore(str(directory / "iterator"))
+        status.assert_nontrivial_match().expect_partial()
+        if self._mixture_runtime is not None and state.get("mixture_runtime") is not None:
+            self._mixture_runtime.restore(state["mixture_runtime"])
+
+    def close(self) -> None:
+        self._closed = True
+        self._stop_event.set()
+        if self._worker is not None and self._worker.is_alive():
+            self._worker.join(timeout=self._config.data.pipeline.worker_shutdown_timeout_seconds)
+            if self._worker.is_alive():
+                raise RuntimeError("RLDS host prefetch worker did not stop before its configured timeout")
+
+    def __enter__(self) -> RldsMixtureDataLoader:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
 
     def _record_bad_batch(self, batch: Mapping[str, Any], exc: Exception) -> None:
         self._recent_bad.append(True)
@@ -515,7 +685,13 @@ class RldsMixtureDataLoader:
                     result[f"source/{source.id}/consecutive_failures"] = float(failures[index])
             if reset_interval:
                 for key in self._metrics:
-                    if key in {"tokenizer_seconds", "host_queue_wait_seconds"} or key.endswith("/tokenizer_seconds"):
+                    if key in {
+                        "tokenizer_seconds",
+                        "host_queue_wait_seconds",
+                        "tfds_fetch_seconds",
+                        "device_submit_seconds",
+                        "host_to_device_block_seconds",
+                    } or key.endswith("/tokenizer_seconds"):
                         self._metrics[key] = 0.0
         return result
 
@@ -530,10 +706,12 @@ class RldsMixtureDataLoader:
             for index, source in enumerate(self._config.data.sources)
         }
         return {
+            "schema_version": 2,
             "seed": self._config.seed,
             "consumed_examples_per_source": global_counts,
             "consumed_batches_per_rank": self._base_batches + self._session_batches,
             "resume_semantics": self._config.data_resume_mode,
+            "iterator_state": "per_rank_tf_checkpoint" if self._config.data_resume_mode == "exact" else None,
             "topology": {
                 "process_count": jax.process_count(),
                 "global_device_count": jax.device_count(),
@@ -555,7 +733,19 @@ def create_train_loader(
     sharding: jax.sharding.Sharding | None,
     start_step: int = 0,
     initial_counts: Mapping[str, int] | None = None,
+    iterator_state_dir: pathlib.Path | None = None,
 ) -> RldsMixtureDataLoader:
+    remaining_examples = max(config.num_train_steps - start_step, 0) * config.batch_size
+    minimum_shortfall = sum(
+        max(limit.min_samples - int((initial_counts or {}).get(source_id, 0)), 0)
+        for source_id, limit in config.data.mixing.source_limits.items()
+        if limit.min_samples is not None
+    )
+    if minimum_shortfall > remaining_examples:
+        raise RuntimeError(
+            f"Source min_samples quotas need {minimum_shortfall} more examples, but only "
+            f"{remaining_examples} examples remain in this run"
+        )
     local_batch_size = _local_batch_size(config.batch_size)
     mixture_runtime = _MixtureRuntime(config, initial_counts)
     datasets = [
@@ -576,10 +766,6 @@ def create_train_loader(
         start_step=0 if exact_resume else start_step,
         mixture_runtime=mixture_runtime,
     )
-    if exact_resume and start_step:
-        # In exact mode every source transform and the mixer are deterministic; replaying the batch ordinal restores
-        # the same next batch without serializing large tf.data buffers into the model checkpoint.
-        dataset = dataset.skip(start_step)
     return RldsMixtureDataLoader(
         config,
         dataset,
@@ -587,6 +773,7 @@ def create_train_loader(
         initial_counts=initial_counts,
         initial_batches=start_step,
         mixture_runtime=mixture_runtime,
+        iterator_state_dir=iterator_state_dir,
     )
 
 
@@ -862,6 +1049,13 @@ def _dynamic_weight_dataset(
         if mixture_runtime is not None
         else tf.constant([True] * len(source_ids), dtype=tf.bool)
     )
+    consumed = (
+        mixture_runtime.counts_variable if mixture_runtime is not None else tf.zeros(len(source_ids), dtype=tf.int64)
+    )
+    local_minimum_targets = tf.constant(
+        mixture_runtime.local_minimum_targets() if mixture_runtime is not None else [0] * len(source_ids),
+        dtype=tf.int64,
+    )
 
     def probabilities(sample_index: Any) -> Any:
         optimizer_step = tf.cast(start_step, tf.int64) + sample_index // tf.cast(local_batch_size, tf.int64)
@@ -880,7 +1074,14 @@ def _dynamic_weight_dataset(
         logits = tf.math.log(selected_weights) / selected_temperature
         result = tf.nn.softmax(logits)
         result = tf.where(active, result, 0.0)
-        effective_minimums = tf.where(active, minimums, 0.0)
+        remaining_run_samples = tf.maximum(
+            (tf.cast(config.num_train_steps, tf.int64) - optimizer_step) * tf.cast(local_batch_size, tf.int64),
+            1,
+        )
+        quota_minimums = tf.cast(tf.maximum(local_minimum_targets - consumed, 0), tf.float32) / tf.cast(
+            remaining_run_samples, tf.float32
+        )
+        effective_minimums = tf.where(active, tf.maximum(minimums, quota_minimums), 0.0)
         effective_maximums = tf.where(active, maximums, 0.0)
         # Iteratively clamp violated coordinates and redistribute the remaining mass among free sources.
         free = tf.ones_like(result, dtype=tf.bool)

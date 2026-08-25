@@ -269,6 +269,18 @@ def _assert_checkpoint(config_path: pathlib.Path, expected_step: int, expected_e
     consumed = sum(state["consumed_examples_per_source"].values())
     if consumed != expected_examples:
         raise RuntimeError(f"Checkpoint {expected_step} consumed {consumed} examples; expected {expected_examples}")
+    if state.get("resume_semantics") == "exact":
+        process_count = int(state["topology"]["process_count"])
+        iterator_root = checkpoint / "data_iterator"
+        rank_directories = sorted(iterator_root.glob("rank-*"))
+        if len(rank_directories) != process_count:
+            raise RuntimeError(
+                f"Checkpoint {expected_step} has {len(rank_directories)} iterator sidecars; expected {process_count}"
+            )
+        for rank_directory in rank_directories:
+            required = (rank_directory / "iterator.index", rank_directory / "runtime_state.json")
+            if not all(path.is_file() for path in required) or not list(rank_directory.glob("iterator.data-*")):
+                raise RuntimeError(f"Incomplete exact-resume iterator sidecar: {rank_directory}")
 
 
 def _assert_rank_logs(log_dir: pathlib.Path, *, probe: bool, expected_ranks: int) -> None:

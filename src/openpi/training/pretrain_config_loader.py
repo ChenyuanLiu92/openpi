@@ -20,8 +20,8 @@ from openpi.models import pi0_config
 from openpi.training import optimizer
 from openpi.training import pretrain_config as _config
 
-SCHEMA_VERSION = 2
-SUPPORTED_SCHEMA_VERSIONS = (1, 2)
+SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3)
 KIND = "pi05_pretrain"
 
 
@@ -127,14 +127,16 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         "distributed",
         "runtime",
         "validation",
+        "cluster",
         "policy_metadata",
     }
-    _check_keys(contents, top_fields, top_fields, "config")
     source_schema = contents["schema_version"]
     if source_schema not in SUPPORTED_SCHEMA_VERSIONS:
         raise ConfigError(f"Unsupported schema_version {source_schema!r}; expected one of {SUPPORTED_SCHEMA_VERSIONS}")
     if contents["kind"] != KIND:
         raise ConfigError(f"Unsupported kind {contents['kind']!r}; expected {KIND!r}")
+    required_top_fields = top_fields if source_schema == 3 else top_fields - {"cluster"}
+    _check_keys(contents, top_fields, required_top_fields, "config")
 
     model_payload = dict(_mapping(contents["model"], "model"))
     if model_payload.pop("type", None) != "pi0":
@@ -160,7 +162,7 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         "sources",
     }
     legacy_data_fields = data_fields - {"pipeline", "mixing"}
-    _check_keys(data_payload, data_fields, data_fields if source_schema == 2 else legacy_data_fields, "data")
+    _check_keys(data_payload, data_fields, data_fields if source_schema >= 2 else legacy_data_fields, "data")
     if data_payload["type"] != "rlds_mixture":
         raise ConfigError("data.type must be 'rlds_mixture'")
     source_values = data_payload["sources"]
@@ -199,7 +201,7 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
     }
     training_required = (
         training_fields
-        if source_schema == 2
+        if source_schema >= 2
         else training_fields
         - {
             "micro_batch_size",
@@ -218,19 +220,29 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         "resume",
         "data_resume_mode",
         "on_topology_change",
+        "on_missing_iterator_state",
+        "iterator_snapshot_timeout_seconds",
     }
     checkpoint_required = (
         checkpoint_fields
-        if source_schema == 2
+        if source_schema == 3
         else checkpoint_fields
         - {
             "data_resume_mode",
             "on_topology_change",
+            "on_missing_iterator_state",
+            "iterator_snapshot_timeout_seconds",
         }
     )
     checkpoint = dict(_mapping(contents["checkpoint"], "checkpoint"))
     _check_keys(checkpoint, checkpoint_fields, checkpoint_required, "checkpoint")
-    checkpoint = {"data_resume_mode": "statistical", "on_topology_change": "statistical", **checkpoint}
+    checkpoint = {
+        "data_resume_mode": "statistical",
+        "on_topology_change": "statistical",
+        "on_missing_iterator_state": "statistical" if source_schema < 3 else "error",
+        "iterator_snapshot_timeout_seconds": 120.0,
+        **checkpoint,
+    }
     logging_required = {"project_name", "wandb_enabled", "log_interval"}
     logging_defaults = {
         "wandb_mode": "online",
@@ -268,7 +280,7 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
     _check_keys(
         distributed_payload,
         distributed_required | {"coordinator_bind_address", "diagnostics"},
-        distributed_required | ({"diagnostics"} if source_schema == 2 else set()),
+        distributed_required | ({"diagnostics"} if source_schema >= 2 else set()),
         "distributed",
     )
     distributed = {"coordinator_bind_address": None, **distributed_payload}
@@ -284,6 +296,20 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         {"enabled", "directory", "minimum_compile_time_seconds", "explain_misses"},
     )
     validation = _section(contents["validation"], "validation", {"interval_steps", "batches_per_source"})
+    cluster_value = contents.get("cluster")
+    if cluster_value is None:
+        cluster_payload = {
+            "platform": "local",
+            "max_restarts": 3,
+            "preemption_grace_seconds": 120,
+            "allow_topology_change": True,
+        }
+    else:
+        cluster_payload = _section(
+            cluster_value,
+            "cluster",
+            {"platform", "max_restarts", "preemption_grace_seconds", "allow_topology_change"},
+        )
     local_device_ids = distributed["local_device_ids"]
     if local_device_ids is not None:
         if not isinstance(local_device_ids, list) or not all(isinstance(item, int) for item in local_device_ids):
@@ -317,6 +343,14 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
         ),
         on_topology_change=_literal(
             checkpoint["on_topology_change"], "checkpoint.on_topology_change", {"error", "statistical"}
+        ),
+        on_missing_iterator_state=_literal(
+            checkpoint["on_missing_iterator_state"],
+            "checkpoint.on_missing_iterator_state",
+            {"error", "statistical"},
+        ),
+        iterator_snapshot_timeout_seconds=_number(
+            checkpoint["iterator_snapshot_timeout_seconds"], "checkpoint.iterator_snapshot_timeout_seconds"
         ),
         num_train_steps=_integer(training["num_train_steps"], "training.num_train_steps"),
         assets_base_dir=_string(paths["assets_base_dir"], "paths.assets_base_dir"),
@@ -382,6 +416,14 @@ def _build_config(contents: dict[str, Any]) -> _config.PretrainConfig:
                 runtime_payload["fatal_cleanup_timeout_seconds"], "runtime.fatal_cleanup_timeout_seconds"
             ),
         ),
+        cluster=_config.ClusterConfig(
+            platform=_literal(cluster_payload["platform"], "cluster.platform", {"local", "slurm"}),
+            max_restarts=_integer(cluster_payload["max_restarts"], "cluster.max_restarts"),
+            preemption_grace_seconds=_integer(
+                cluster_payload["preemption_grace_seconds"], "cluster.preemption_grace_seconds"
+            ),
+            allow_topology_change=_boolean(cluster_payload["allow_topology_change"], "cluster.allow_topology_change"),
+        ),
         policy_metadata=policy_metadata,
     )
 
@@ -425,7 +467,7 @@ def _build_source(value: Any, index: int) -> _config.RldsSourceConfig:
 
 def _build_pipeline(value: Any, *, source_schema: int) -> _config.PipelineConfig:
     if value is None and source_schema == 1:
-        return _config.PipelineConfig(1, 0, 0, "fail", 1000, 1, 0.0, None)
+        return _config.PipelineConfig(1, 0, 0, "fail", 1000, 1, 0.0, None, 0, 1.0, 30.0, 100, 10.0)
     fields = {
         "tokenizer_threads",
         "host_prefetch_batches",
@@ -435,8 +477,34 @@ def _build_pipeline(value: Any, *, source_schema: int) -> _config.PipelineConfig
         "max_bad_samples",
         "max_bad_fraction",
         "quarantine_dir",
+        "source_max_retries",
+        "source_retry_initial_seconds",
+        "source_retry_max_seconds",
+        "metrics_sample_interval_steps",
+        "worker_shutdown_timeout_seconds",
     }
-    payload = _section(value, "data.pipeline", fields, nullable={"quarantine_dir"})
+    required = (
+        fields
+        if source_schema == 3
+        else fields
+        - {
+            "source_max_retries",
+            "source_retry_initial_seconds",
+            "source_retry_max_seconds",
+            "metrics_sample_interval_steps",
+            "worker_shutdown_timeout_seconds",
+        }
+    )
+    payload = dict(_mapping(value, "data.pipeline"))
+    _check_keys(payload, fields, required, "data.pipeline")
+    payload = {
+        "source_max_retries": 0,
+        "source_retry_initial_seconds": 1.0,
+        "source_retry_max_seconds": 30.0,
+        "metrics_sample_interval_steps": 100,
+        "worker_shutdown_timeout_seconds": 10.0,
+        **payload,
+    }
     return _config.PipelineConfig(
         tokenizer_threads=_integer(payload["tokenizer_threads"], "data.pipeline.tokenizer_threads"),
         host_prefetch_batches=_integer(payload["host_prefetch_batches"], "data.pipeline.host_prefetch_batches"),
@@ -448,6 +516,17 @@ def _build_pipeline(value: Any, *, source_schema: int) -> _config.PipelineConfig
         max_bad_samples=_integer(payload["max_bad_samples"], "data.pipeline.max_bad_samples"),
         max_bad_fraction=_number(payload["max_bad_fraction"], "data.pipeline.max_bad_fraction"),
         quarantine_dir=_nullable_string(payload["quarantine_dir"], "data.pipeline.quarantine_dir"),
+        source_max_retries=_integer(payload["source_max_retries"], "data.pipeline.source_max_retries"),
+        source_retry_initial_seconds=_number(
+            payload["source_retry_initial_seconds"], "data.pipeline.source_retry_initial_seconds"
+        ),
+        source_retry_max_seconds=_number(payload["source_retry_max_seconds"], "data.pipeline.source_retry_max_seconds"),
+        metrics_sample_interval_steps=_integer(
+            payload["metrics_sample_interval_steps"], "data.pipeline.metrics_sample_interval_steps"
+        ),
+        worker_shutdown_timeout_seconds=_number(
+            payload["worker_shutdown_timeout_seconds"], "data.pipeline.worker_shutdown_timeout_seconds"
+        ),
     )
 
 
@@ -521,6 +600,9 @@ def _build_diagnostics(value: Any, *, source_schema: int) -> _config.Distributed
             straggler_ratio_threshold=1.5,
             profile_start_step=None,
             profile_num_steps=5,
+            collective_baseline_path=None,
+            minimum_baseline_fraction=0.8,
+            bandwidth_regression_policy="warn",
         )
     fields = {
         "topology_check",
@@ -530,8 +612,28 @@ def _build_diagnostics(value: Any, *, source_schema: int) -> _config.Distributed
         "straggler_ratio_threshold",
         "profile_start_step",
         "profile_num_steps",
+        "collective_baseline_path",
+        "minimum_baseline_fraction",
+        "bandwidth_regression_policy",
     }
-    payload = _section(value, "distributed.diagnostics", fields, nullable={"profile_start_step"})
+    required = (
+        fields
+        if source_schema == 3
+        else fields
+        - {
+            "collective_baseline_path",
+            "minimum_baseline_fraction",
+            "bandwidth_regression_policy",
+        }
+    )
+    payload = dict(_mapping(value, "distributed.diagnostics"))
+    _check_keys(payload, fields, required, "distributed.diagnostics")
+    payload = {
+        "collective_baseline_path": None,
+        "minimum_baseline_fraction": 0.8,
+        "bandwidth_regression_policy": "warn",
+        **payload,
+    }
     sizes = payload["tensor_sizes_mib"]
     if not isinstance(sizes, list):
         raise ConfigError("distributed.diagnostics.tensor_sizes_mib must be a list")
@@ -549,6 +651,17 @@ def _build_diagnostics(value: Any, *, source_schema: int) -> _config.Distributed
             payload["profile_start_step"], "distributed.diagnostics.profile_start_step"
         ),
         profile_num_steps=_integer(payload["profile_num_steps"], "distributed.diagnostics.profile_num_steps"),
+        collective_baseline_path=_nullable_string(
+            payload["collective_baseline_path"], "distributed.diagnostics.collective_baseline_path"
+        ),
+        minimum_baseline_fraction=_number(
+            payload["minimum_baseline_fraction"], "distributed.diagnostics.minimum_baseline_fraction"
+        ),
+        bandwidth_regression_policy=_literal(
+            payload["bandwidth_regression_policy"],
+            "distributed.diagnostics.bandwidth_regression_policy",
+            {"warn", "fail"},
+        ),
     )
 
 

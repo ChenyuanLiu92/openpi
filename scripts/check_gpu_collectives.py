@@ -41,6 +41,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--measure-iterations", type=int, default=5)
     parser.add_argument("--skip-bandwidth", action="store_true")
     parser.add_argument("--skip-topology-check", action="store_true")
+    parser.add_argument("--write-baseline", help="Write measured bandwidths to this JSON file (rank 0 only).")
+    parser.add_argument("--baseline", help="Compare measured bandwidths with this JSON baseline.")
+    parser.add_argument("--minimum-baseline-fraction", type=float, default=0.8)
+    parser.add_argument("--bandwidth-regression-policy", choices=("warn", "fail"), default="fail")
     return parser.parse_args()
 
 
@@ -82,8 +86,9 @@ def main() -> None:
     if args.expected_device_count is not None and len(devices) != args.expected_device_count:
         raise RuntimeError(f"Expected {args.expected_device_count} JAX devices, but found {len(devices)}: {devices}")
 
+    topology = None
     if not args.skip_topology_check:
-        gpu_collectives.log_topology_diagnostics()
+        topology = gpu_collectives.log_topology_diagnostics()
     gpu_collectives.log_cuda_cache_configuration(devices)
     result = gpu_collectives.run_local_fsdp_collective_probe(
         devices=devices,
@@ -117,12 +122,23 @@ def main() -> None:
         fsdp_devices = args.fsdp_devices or jax.device_count()
         mesh = sharding.make_mesh(fsdp_devices)
         sizes = tuple(float(value) for value in args.tensor_sizes_mib.split(",") if value)
-        gpu_collectives.benchmark_global_collectives(
+        bandwidth_results = gpu_collectives.benchmark_global_collectives(
             mesh,
             tensor_sizes_mib=sizes,
             warmup_iterations=args.warmup_iterations,
             measure_iterations=args.measure_iterations,
         )
+        if args.write_baseline:
+            gpu_collectives.write_collective_baseline(args.write_baseline, bandwidth_results, topology=topology)
+        if args.baseline:
+            gpu_collectives.validate_collective_baseline(
+                args.baseline,
+                bandwidth_results,
+                minimum_fraction=args.minimum_baseline_fraction,
+                policy=args.bandwidth_regression_policy,
+            )
+    elif args.write_baseline or args.baseline:
+        raise ValueError("--write-baseline/--baseline require bandwidth benchmarks on at least two global devices")
 
 
 if __name__ == "__main__":
