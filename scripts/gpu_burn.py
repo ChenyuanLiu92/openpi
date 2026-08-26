@@ -155,6 +155,11 @@ def main() -> None:
     args = _parse_args()
     _validate_args(args)
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    # JAX's allocator otherwise caps usable framebuffer memory below the
+    # production burn target even when the physical device has ample space.
+    # Keep headroom for the driver and checksum kernels while allowing the
+    # requested 75 GiB validation footprint on a 96 GiB device.
+    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.90")
     import jax
     import jax.numpy as jnp
 
