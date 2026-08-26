@@ -12,12 +12,15 @@ from . import launch_pretrain
 
 
 def _config(tmp_path: pathlib.Path, *, batch_size: int = 8, fsdp_devices: int = 8):
+    diagnostics = types.SimpleNamespace(
+        tensor_sizes_mib=(1, 16), warmup_iterations=1, measure_iterations=2, topology_check=True
+    )
     return types.SimpleNamespace(
         batch_size=batch_size,
         fsdp_devices=fsdp_devices,
         exp_name="test",
         checkpoint_dir=tmp_path / "checkpoints" / "name" / "test",
-        distributed=types.SimpleNamespace(initialize=False),
+        distributed=types.SimpleNamespace(initialize=False, diagnostics=diagnostics),
     )
 
 
@@ -45,6 +48,26 @@ def test_rank_command_injects_runtime_topology(tmp_path: pathlib.Path):
     local_ids = command.index("--distributed.local-device-ids")
     assert command[local_ids + 1 : local_ids + 5] == ["4", "5", "6", "7"]
     assert command[-2:] == ["--distributed.coordinator-bind-address", "[::]:12345"]
+
+
+def test_probe_rank_command_forwards_bandwidth_baseline(tmp_path: pathlib.Path):
+    command = launch_pretrain._rank_command(  # noqa: SLF001
+        config_path=tmp_path / "config.yaml",
+        config=_config(tmp_path),
+        spec=launch_pretrain.RankSpec(0, (0, 1, 2, 3)),
+        num_processes=2,
+        coordinator_address="127.0.0.1:12345",
+        coordinator_bind_address="[::]:12345",
+        probe_only=True,
+        overrides=(),
+        write_baseline=tmp_path / "baseline.json",
+        minimum_baseline_fraction=0.85,
+        bandwidth_regression_policy="warn",
+    )
+
+    assert command[command.index("--write-baseline") + 1] == str(tmp_path / "baseline.json")
+    assert command[command.index("--minimum-baseline-fraction") + 1] == "0.85"
+    assert command[command.index("--bandwidth-regression-policy") + 1] == "warn"
 
 
 def test_local_dry_run_builds_two_ranks(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys):
