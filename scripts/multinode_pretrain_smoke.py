@@ -289,7 +289,9 @@ def _assert_rank_logs(log_dir: pathlib.Path, *, probe: bool, expected_ranks: int
         raise RuntimeError(f"Expected {expected_ranks} rank logs in {log_dir}; found {logs}")
     combined = "\n".join(path.read_text() for path in logs)
     if probe:
-        if combined.count("Global collective check passed") < expected_ranks:
+        if expected_ranks == 1 and "Collective check passed" not in combined:
+            raise RuntimeError("The local rank did not report a passing collective probe")
+        if expected_ranks > 1 and combined.count("Global collective check passed") < expected_ranks:
             raise RuntimeError("Not all ranks reported a passing global collective probe")
     elif any(f"process {rank}/{expected_ranks}" not in combined for rank in range(expected_ranks)):
         raise RuntimeError("Training logs do not contain every JAX process identity")
