@@ -76,6 +76,10 @@ def _parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
     local.add_argument("--coordinator-address", help="Defaults to a free 127.0.0.1 port.")
     local.add_argument("--log-dir", type=pathlib.Path)
     local.add_argument("--probe-only", action="store_true")
+    local.add_argument("--write-baseline", type=pathlib.Path)
+    local.add_argument("--baseline", type=pathlib.Path)
+    local.add_argument("--minimum-baseline-fraction", type=float, default=0.8)
+    local.add_argument("--bandwidth-regression-policy", choices=("warn", "fail"), default="fail")
     local.add_argument("--dry-run", action="store_true")
     local.add_argument("--shutdown-grace-seconds", type=float, default=15.0)
     local.add_argument("--min-memory-headroom-gib", type=float, default=0.0)
@@ -198,6 +202,10 @@ def _rank_command(
     coordinator_bind_address: str | None,
     probe_only: bool,
     overrides: Sequence[str],
+    write_baseline: pathlib.Path | None = None,
+    baseline: pathlib.Path | None = None,
+    minimum_baseline_fraction: float = 0.8,
+    bandwidth_regression_policy: str = "fail",
 ) -> list[str]:
     local_ids = ",".join(str(device_id) for device_id in spec.local_device_ids)
     if probe_only:
@@ -227,6 +235,18 @@ def _rank_command(
             command.append("--skip-topology-check")
         if coordinator_bind_address is not None:
             command.extend(["--coordinator-bind-address", coordinator_bind_address])
+        if write_baseline is not None:
+            command.extend(["--write-baseline", str(write_baseline)])
+        if baseline is not None:
+            command.extend(["--baseline", str(baseline)])
+        command.extend(
+            [
+                "--minimum-baseline-fraction",
+                str(minimum_baseline_fraction),
+                "--bandwidth-regression-policy",
+                bandwidth_regression_policy,
+            ]
+        )
         return command
 
     command = [sys.executable, str(_PRETRAIN_SCRIPT), str(config_path), *overrides]
@@ -348,6 +368,10 @@ def _run_local(args: argparse.Namespace) -> int:
         raise ValueError("shutdown-grace-seconds must be non-negative")
     if args.max_cgroup_memory_percent != 0 and not 0 < args.max_cgroup_memory_percent < 100:
         raise ValueError("max-cgroup-memory-percent must be 0 or between 0 and 100")
+    if (args.write_baseline is not None or args.baseline is not None) and not args.probe_only:
+        raise ValueError("--write-baseline/--baseline require --probe-only")
+    if not 0 < args.minimum_baseline_fraction <= 1:
+        raise ValueError("--minimum-baseline-fraction must be in (0, 1]")
     _wait_for_memory(
         args.min_memory_headroom_gib,
         args.wait_for_memory_seconds,
@@ -368,6 +392,10 @@ def _run_local(args: argparse.Namespace) -> int:
             coordinator_bind_address=coordinator_bind_address,
             probe_only=args.probe_only,
             overrides=overrides,
+            write_baseline=args.write_baseline,
+            baseline=args.baseline,
+            minimum_baseline_fraction=args.minimum_baseline_fraction,
+            bandwidth_regression_policy=args.bandwidth_regression_policy,
         )
         for spec in specs
     ]
